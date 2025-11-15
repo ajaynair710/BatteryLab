@@ -74,6 +74,115 @@ def _standardize_columns(df: pd.DataFrame):
             cyc = df.columns[i]; break
     return vcol, qcol, cyc
 
+def _detect_cycle_level_data(df: pd.DataFrame):
+    """Detect if data is in cycle-level format (one row per cycle)"""
+    cols_l = [c.lower() for c in df.columns]
+    has_cycle = any(c in ["cycle", "cycle_number", "cycle_idx"] for c in cols_l)
+    has_discharge_cap = any("discharge_capacity" in c or "discharge_cap" in c or 
+                           (c in ["capacity", "cap", "q"] and "discharge" in " ".join(cols_l)) 
+                           for c in cols_l)
+    has_ir = any("internal_resistance" in c or "ir" == c or "resistance" in c 
+                for c in cols_l)
+    has_temp = any("temperature" in c or "temp" == c for c in cols_l)
+    return has_cycle and (has_discharge_cap or has_ir or has_temp)
+
+def _parse_cycle_level_data(df: pd.DataFrame):
+    """Parse cycle-level data and extract cycle metrics"""
+    cols_l = [c.lower() for c in df.columns]
+    
+    # Find cycle column
+    cycle_col = None
+    for i, c in enumerate(cols_l):
+        if c in ["cycle", "cycle_number", "cycle_idx"]:
+            cycle_col = df.columns[i]
+            break
+    
+    # Find discharge capacity
+    cap_col = None
+    for i, c in enumerate(cols_l):
+        if "discharge_capacity" in c or ("capacity" in c and "discharge" in " ".join(cols_l[:i+1])):
+            cap_col = df.columns[i]
+            break
+    if cap_col is None:
+        for i, c in enumerate(cols_l):
+            if c in ["capacity", "cap", "q", "discharge_cap"]:
+                cap_col = df.columns[i]
+                break
+    
+    # Find internal resistance
+    ir_col = None
+    for i, c in enumerate(cols_l):
+        if "internal_resistance" in c or c == "ir" or ("resistance" in c and "internal" in " ".join(cols_l[:i+1])):
+            ir_col = df.columns[i]
+            break
+    
+    # Find temperature
+    temp_col = None
+    for i, c in enumerate(cols_l):
+        if "temperature" in c or c == "temp":
+            temp_col = df.columns[i]
+            break
+    
+    if cycle_col is None or cap_col is None:
+        return None
+    
+    # Extract cycle-level data
+    cycle_data = df[[cycle_col, cap_col]].copy()
+    cycle_data.columns = ['cycle', 'discharge_capacity']
+    
+    if ir_col:
+        cycle_data['internal_resistance'] = pd.to_numeric(df[ir_col], errors='coerce')
+    else:
+        cycle_data['internal_resistance'] = np.nan
+    
+    if temp_col:
+        cycle_data['temperature'] = pd.to_numeric(df[temp_col], errors='coerce')
+    else:
+        cycle_data['temperature'] = np.nan
+    
+    # Convert cycle to numeric
+    cycle_data['cycle'] = pd.to_numeric(cycle_data['cycle'], errors='coerce')
+    cycle_data['discharge_capacity'] = pd.to_numeric(cycle_data['discharge_capacity'], errors='coerce')
+    
+    # Convert mAh to Ah if needed
+    if cycle_data['discharge_capacity'].max() > 100:
+        cycle_data['discharge_capacity'] = cycle_data['discharge_capacity'] / 1000.0
+    
+    cycle_data = cycle_data.sort_values('cycle').reset_index(drop=True)
+    return cycle_data
+
+def _parse_time_series_columns(df: pd.DataFrame):
+    """Parse optional time-series columns: time_<cycle>, current_<cycle>, voltage_<cycle>"""
+    time_series = {}
+    cols = df.columns
+    
+    # Find all time-series columns
+    for col in cols:
+        col_l = col.lower()
+        if col_l.startswith('time_'):
+            cycle_num = col_l.replace('time_', '')
+            if cycle_num.isdigit():
+                cycle_num = int(cycle_num)
+                if cycle_num not in time_series:
+                    time_series[cycle_num] = {}
+                time_series[cycle_num]['time'] = pd.to_numeric(df[col], errors='coerce').values
+        elif col_l.startswith('current_'):
+            cycle_num = col_l.replace('current_', '')
+            if cycle_num.isdigit():
+                cycle_num = int(cycle_num)
+                if cycle_num not in time_series:
+                    time_series[cycle_num] = {}
+                time_series[cycle_num]['current'] = pd.to_numeric(df[col], errors='coerce').values
+        elif col_l.startswith('voltage_'):
+            cycle_num = col_l.replace('voltage_', '')
+            if cycle_num.isdigit():
+                cycle_num = int(cycle_num)
+                if cycle_num not in time_series:
+                    time_series[cycle_num] = {}
+                time_series[cycle_num]['voltage'] = pd.to_numeric(df[col], errors='coerce').values
+    
+    return time_series
+
 def _prep_series(voltage, capacity):
     V = pd.to_numeric(voltage, errors="coerce").to_numpy()
     Qraw = pd.to_numeric(capacity, errors="coerce").to_numpy()
@@ -146,6 +255,131 @@ def _compare_two_sets(name_a, feat_a, name_b, feat_b):
         interp.append(f"No strong differences detected between {name_a} and {name_b} within prototype sensitivity.")
     return interp
 
+def _extract_cycle_features(cycle_data: pd.DataFrame):
+    """Extract key features from cycle-level data"""
+    features = {}
+    
+    if len(cycle_data) == 0:
+        return features
+    
+    # Basic stats
+    features['n_cycles'] = int(len(cycle_data))
+    features['cycle_range'] = [int(cycle_data['cycle'].min()), int(cycle_data['cycle'].max())]
+    
+    # Capacity features
+    cap = cycle_data['discharge_capacity'].dropna()
+    if len(cap) > 0:
+        features['capacity_max_Ah'] = float(cap.max())
+        features['capacity_min_Ah'] = float(cap.min())
+        features['capacity_mean_Ah'] = float(cap.mean())
+        features['capacity_std_Ah'] = float(cap.std()) if len(cap) > 1 else 0.0
+        features['capacity_initial_Ah'] = float(cap.iloc[0]) if len(cap) > 0 else np.nan
+        features['capacity_final_Ah'] = float(cap.iloc[-1]) if len(cap) > 0 else np.nan
+        
+        # Fade rate calculations
+        if len(cap) >= 2:
+            # Linear fade rate (% per cycle)
+            cycles = cycle_data['cycle'].dropna().values
+            if len(cycles) == len(cap):
+                valid_mask = np.isfinite(cap.values) & np.isfinite(cycles)
+                if np.sum(valid_mask) >= 2:
+                    coeffs = np.polyfit(cycles[valid_mask], cap.values[valid_mask], 1)
+                    fade_rate_per_cycle = -coeffs[0] / cap.values[valid_mask][0] * 100.0 if cap.values[valid_mask][0] > 0 else 0.0
+                    features['fade_rate_percent_per_cycle'] = float(fade_rate_per_cycle)
+            
+            # Total fade percentage
+            if features['capacity_initial_Ah'] > 0:
+                total_fade_pct = 100.0 * (features['capacity_initial_Ah'] - features['capacity_final_Ah']) / features['capacity_initial_Ah']
+                features['total_fade_percent'] = float(total_fade_pct)
+    
+    # Internal resistance features
+    ir = cycle_data['internal_resistance'].dropna()
+    if len(ir) > 0:
+        features['ir_max_Ohm'] = float(ir.max())
+        features['ir_min_Ohm'] = float(ir.min())
+        features['ir_mean_Ohm'] = float(ir.mean())
+        features['ir_std_Ohm'] = float(ir.std()) if len(ir) > 1 else 0.0
+        features['ir_initial_Ohm'] = float(ir.iloc[0]) if len(ir) > 0 else np.nan
+        features['ir_final_Ohm'] = float(ir.iloc[-1]) if len(ir) > 0 else np.nan
+        if features['ir_initial_Ohm'] > 0:
+            ir_growth_pct = 100.0 * (features['ir_final_Ohm'] - features['ir_initial_Ohm']) / features['ir_initial_Ohm']
+            features['ir_growth_percent'] = float(ir_growth_pct)
+    
+    # Temperature features
+    temp = cycle_data['temperature'].dropna()
+    if len(temp) > 0:
+        features['temp_max_C'] = float(temp.max())
+        features['temp_min_C'] = float(temp.min())
+        features['temp_mean_C'] = float(temp.mean())
+        features['temp_std_C'] = float(temp.std()) if len(temp) > 1 else 0.0
+    
+    return features
+
+def _generate_degradation_interpretations(cycle_features: dict, cycle_data: pd.DataFrame):
+    """Generate AI-style interpretations of degradation trends"""
+    interps = []
+    
+    if not cycle_features:
+        return ["Insufficient cycle data for degradation analysis."]
+    
+    # Capacity fade analysis
+    if 'total_fade_percent' in cycle_features:
+        fade_pct = cycle_features['total_fade_percent']
+        if fade_pct > 20:
+            interps.append(f"Severe capacity fade detected: {fade_pct:.1f}% loss over {cycle_features.get('n_cycles', 'N')} cycles. This suggests accelerated degradation, possibly due to high C-rates, temperature extremes, or material instability.")
+        elif fade_pct > 10:
+            interps.append(f"Moderate capacity fade: {fade_pct:.1f}% loss. Typical for standard cycling conditions. Monitor for acceleration in later cycles.")
+        elif fade_pct > 5:
+            interps.append(f"Mild capacity fade: {fade_pct:.1f}% loss. Performance is relatively stable.")
+        elif fade_pct > 0:
+            interps.append(f"Minimal capacity fade: {fade_pct:.1f}% loss. Excellent cycle life performance.")
+        else:
+            interps.append("No capacity fade detected. Capacity may have increased slightly (measurement variation or conditioning).")
+    
+    # Fade rate analysis
+    if 'fade_rate_percent_per_cycle' in cycle_features:
+        rate = cycle_features['fade_rate_percent_per_cycle']
+        if rate > 0.1:
+            interps.append(f"High fade rate: {rate:.3f}% per cycle. Projected end-of-life (80% SOH) in ~{int(20/rate)} cycles if trend continues.")
+        elif rate > 0.05:
+            interps.append(f"Moderate fade rate: {rate:.3f}% per cycle. Projected 80% SOH in ~{int(20/rate)} cycles.")
+        elif rate > 0:
+            interps.append(f"Low fade rate: {rate:.3f}% per cycle. Good cycle life expected.")
+    
+    # Internal resistance growth
+    if 'ir_growth_percent' in cycle_features:
+        ir_growth = cycle_features['ir_growth_percent']
+        if ir_growth > 50:
+            interps.append(f"Significant IR growth: {ir_growth:.1f}% increase. This indicates severe impedance rise, likely from SEI growth, contact loss, or electrolyte degradation.")
+        elif ir_growth > 20:
+            interps.append(f"Moderate IR growth: {ir_growth:.1f}% increase. Typical for extended cycling. May correlate with capacity fade.")
+        elif ir_growth > 0:
+            interps.append(f"Mild IR growth: {ir_growth:.1f}% increase. Resistance evolution is within normal range.")
+    
+    # Temperature analysis
+    if 'temp_mean_C' in cycle_features:
+        temp_mean = cycle_features['temp_mean_C']
+        if temp_mean > 45:
+            interps.append(f"High average temperature: {temp_mean:.1f}°C. Elevated temperatures accelerate degradation and may explain observed fade.")
+        elif temp_mean < 10:
+            interps.append(f"Low average temperature: {temp_mean:.1f}°C. Cold conditions can increase impedance and reduce capacity utilization.")
+        else:
+            interps.append(f"Temperature in normal range: {temp_mean:.1f}°C average. Thermal conditions appear favorable.")
+    
+    # Correlation insights
+    if 'ir_growth_percent' in cycle_features and 'total_fade_percent' in cycle_features:
+        ir_growth = cycle_features['ir_growth_percent']
+        fade = cycle_features['total_fade_percent']
+        if ir_growth > 20 and fade > 10:
+            interps.append("Both capacity fade and IR growth are significant. This pattern suggests combined loss of active material (LAM) and loss of lithium inventory (LLI), possibly from SEI growth or electrode degradation.")
+        elif ir_growth > fade * 2:
+            interps.append("IR growth exceeds capacity fade proportionally. This may indicate impedance-dominated degradation, possibly from contact issues or electrolyte depletion.")
+    
+    if not interps:
+        interps.append("Cycle data available but degradation trends are minimal or within measurement uncertainty.")
+    
+    return interps
+
 # Plot -> PNG bytes for embedding in PDF
 def _plot_to_bytes(df_all, ycol, title):
     fig, ax = plt.subplots(figsize=(6.2, 3.8), dpi=150)
@@ -163,7 +397,70 @@ def _plot_to_bytes(df_all, ycol, title):
     buf.seek(0)
     return buf.getvalue()
 
-def generate_pdf_report(features_by_group, richness_notes, suggestions, interps, vc_all, ica_all):
+def _plot_cycle_life(cycle_data: pd.DataFrame, y_col: str, y_label: str, title: str):
+    """Plot cycle-life data (capacity, IR, or temperature vs cycle)"""
+    fig, ax = plt.subplots(figsize=(6.2, 3.8), dpi=150)
+    valid = cycle_data.dropna(subset=['cycle', y_col])
+    if len(valid) > 0:
+        ax.plot(valid['cycle'], valid[y_col], 'o-', markersize=4, linewidth=1.5)
+        ax.set_xlabel("Cycle Number")
+        ax.set_ylabel(y_label)
+        ax.set_title(title)
+        ax.grid(True, alpha=0.3)
+    fig.tight_layout()
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", dpi=150)
+    plt.close(fig)
+    buf.seek(0)
+    return buf.getvalue()
+
+def _plot_time_series(time_series: dict, cycle_nums: list, title_prefix: str):
+    """Plot current/voltage time-series for selected cycles"""
+    if not time_series or not cycle_nums:
+        return None
+    
+    fig, axes = plt.subplots(len(cycle_nums), 2, figsize=(10, 3*len(cycle_nums)), dpi=150)
+    if len(cycle_nums) == 1:
+        axes = axes.reshape(1, -1)
+    
+    for idx, cycle_num in enumerate(cycle_nums):
+        if cycle_num not in time_series:
+            continue
+        
+        ts = time_series[cycle_num]
+        time = ts.get('time', None)
+        current = ts.get('current', None)
+        voltage = ts.get('voltage', None)
+        
+        if time is not None and current is not None:
+            valid = np.isfinite(time) & np.isfinite(current)
+            if np.any(valid):
+                axes[idx, 0].plot(time[valid], current[valid], 'b-', linewidth=1.5)
+                axes[idx, 0].set_xlabel("Time (s)")
+                axes[idx, 0].set_ylabel("Current (A)")
+                axes[idx, 0].set_title(f"Cycle {cycle_num} - Current")
+                axes[idx, 0].grid(True, alpha=0.3)
+        
+        if time is not None and voltage is not None:
+            valid = np.isfinite(time) & np.isfinite(voltage)
+            if np.any(valid):
+                axes[idx, 1].plot(time[valid], voltage[valid], 'r-', linewidth=1.5)
+                axes[idx, 1].set_xlabel("Time (s)")
+                axes[idx, 1].set_ylabel("Voltage (V)")
+                axes[idx, 1].set_title(f"Cycle {cycle_num} - Voltage")
+                axes[idx, 1].grid(True, alpha=0.3)
+    
+    fig.suptitle(title_prefix, fontsize=12)
+    fig.tight_layout()
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", dpi=150)
+    plt.close(fig)
+    buf.seek(0)
+    return buf.getvalue()
+
+def generate_pdf_report(features_by_group=None, richness_notes=None, suggestions=None, interps=None, 
+                       vc_all=None, ica_all=None, cycle_data=None, cycle_features=None, 
+                       degradation_interps=None, time_series=None):
     buffer = io.BytesIO()
     doc = SimpleDocTemplate(buffer, pagesize=A4, rightMargin=24, leftMargin=24, topMargin=24, bottomMargin=24)
     styles = getSampleStyleSheet()
@@ -172,64 +469,148 @@ def generate_pdf_report(features_by_group, richness_notes, suggestions, interps,
     elements.append(Paragraph("BatteryLab Analytics Report", styles["Title"]))
     elements.append(Spacer(1, 8))
 
-    elements.append(Paragraph("Dataset Quality & Richness", styles["Heading2"]))
-    if richness_notes:
-        for r in richness_notes:
-            elements.append(Paragraph("- " + r, styles["Normal"]))
-    else:
-        elements.append(Paragraph("No specific richness notes.", styles["Normal"]))
-    elements.append(Spacer(1, 6))
+    # Cycle-life analysis section (if available)
+    if cycle_data is not None and len(cycle_data) > 0:
+        elements.append(Paragraph("Cycle-Life Analysis", styles["Heading2"]))
 
-    elements.append(Paragraph("Next-Step Suggestions", styles["Heading2"]))
-    if suggestions:
-        for s in suggestions:
-            elements.append(Paragraph("- " + s, styles["Normal"]))
-    else:
-        elements.append(Paragraph("No suggestions generated.", styles["Normal"]))
-    elements.append(Spacer(1, 6))
+        # Cycle features table
+        if cycle_features:
+            elements.append(Paragraph("Cycle-Level Statistics", styles["Heading3"]))
+            feat_table = [["Metric", "Value"]]
+            if 'n_cycles' in cycle_features:
+                feat_table.append(["Number of Cycles", str(cycle_features['n_cycles'])])
+            if 'capacity_initial_Ah' in cycle_features and np.isfinite(cycle_features['capacity_initial_Ah']):
+                feat_table.append(["Initial Capacity (Ah)", f"{cycle_features['capacity_initial_Ah']:.3f}"])
+            if 'capacity_final_Ah' in cycle_features and np.isfinite(cycle_features['capacity_final_Ah']):
+                feat_table.append(["Final Capacity (Ah)", f"{cycle_features['capacity_final_Ah']:.3f}"])
+            if 'total_fade_percent' in cycle_features and np.isfinite(cycle_features['total_fade_percent']):
+                feat_table.append(["Total Fade (%)", f"{cycle_features['total_fade_percent']:.2f}"])
+            if 'fade_rate_percent_per_cycle' in cycle_features and np.isfinite(cycle_features['fade_rate_percent_per_cycle']):
+                feat_table.append(["Fade Rate (%/cycle)", f"{cycle_features['fade_rate_percent_per_cycle']:.4f}"])
+            if 'ir_initial_Ohm' in cycle_features and np.isfinite(cycle_features['ir_initial_Ohm']):
+                feat_table.append(["Initial IR (Ohm)", f"{cycle_features['ir_initial_Ohm']:.4f}"])
+            if 'ir_final_Ohm' in cycle_features and np.isfinite(cycle_features['ir_final_Ohm']):
+                feat_table.append(["Final IR (Ohm)", f"{cycle_features['ir_final_Ohm']:.4f}"])
+            if 'ir_growth_percent' in cycle_features and np.isfinite(cycle_features['ir_growth_percent']):
+                feat_table.append(["IR Growth (%)", f"{cycle_features['ir_growth_percent']:.2f}"])
 
-    elements.append(Paragraph("Key Features by Curve", styles["Heading2"]))
-    table_data = [["Curve", "n_samples", "V Range (V)", "Capacity Range (Ah)",
-                   "ICA Peaks", "ICA Voltages (V)", "ICA Widths (V)", "Median |dV/dQ|"]]
-    for g, f in features_by_group.items():
-        table_data.append([
-            str(g),
-            f['n_samples'],
-            f"{f['voltage_range_V'][0]:.2f}–{f['voltage_range_V'][1]:.2f}",
-            f"{f['cap_range_Ah'][0]:.2f}–{f['cap_range_Ah'][1]:.2f}",
-            f['ica_peaks_count'],
-            ", ".join([f"{v:.3f}" for v in f['ica_peak_voltages_V']]) if f['ica_peak_voltages_V'] else "—",
-            ", ".join([f"{w:.3f}" for w in f['ica_peak_widths_V']]) if f['ica_peak_widths_V'] else "—",
-            f"{f['dVdQ_median_abs']:.4f}" if np.isfinite(f['dVdQ_median_abs']) else "—"
-        ])
-    tbl = Table(table_data, repeatRows=1)
-    tbl.setStyle(TableStyle([
-        ('BACKGROUND', (0,0), (-1,0), colors.lightgrey),
-        ('GRID', (0,0), (-1,-1), 0.25, colors.black),
-        ('FONTNAME', (0,0), (-1,0), 'Helvetica-Bold'),
-        ('FONTSIZE', (0,0), (-1,-1), 9),
-        ('ALIGN', (1,1), (-1,-1), 'CENTER')
-    ]))
-    elements.append(tbl)
-    elements.append(Spacer(1, 6))
+            if len(feat_table) > 1:
+                tbl_feat = Table(feat_table, repeatRows=1)
+                tbl_feat.setStyle(TableStyle([
+                    ('BACKGROUND', (0,0), (-1,0), colors.lightgrey),
+                    ('GRID', (0,0), (-1,-1), 0.25, colors.black),
+                    ('FONTNAME', (0,0), (-1,0), 'Helvetica-Bold'),
+                    ('FONTSIZE', (0,0), (-1,-1), 9),
+                ]))
+                elements.append(tbl_feat)
+                elements.append(Spacer(1, 6))
 
-    elements.append(Paragraph("AI-style Interpretations", styles["Heading2"]))
-    if interps:
-        for i in interps:
-            elements.append(Paragraph("- " + i, styles["Normal"]))
-    else:
-        elements.append(Paragraph("No interpretations generated.", styles["Normal"]))
-    elements.append(Spacer(1, 6))
+        # Cycle-life plots
+        elements.append(Paragraph("Cycle-Life Plots", styles["Heading3"]))
+        if 'discharge_capacity' in cycle_data.columns:
+            img_bytes = _plot_cycle_life(cycle_data, 'discharge_capacity', 'Discharge Capacity (Ah)',
+                                         'Discharge Capacity vs Cycle Life')
+            elements.append(Image(io.BytesIO(img_bytes), width=420, height=270))
+            elements.append(Spacer(1, 6))
 
-    elements.append(Paragraph("Visualizations", styles["Heading2"]))
-    if vc_all is not None and len(vc_all) > 0:
-        elements.append(Paragraph("Voltage vs Capacity", styles["Heading3"]))
-        img_bytes = _plot_to_bytes(vc_all, "Capacity_Ah", "Voltage vs Capacity")
-        elements.append(Image(io.BytesIO(img_bytes), width=420, height=270))
-    if ica_all is not None and len(ica_all) > 0:
-        elements.append(Paragraph("ICA: dQ/dV vs Voltage", styles["Heading3"]))
-        img_bytes = _plot_to_bytes(ica_all, "dQdV", "ICA: dQ/dV vs Voltage")
-        elements.append(Image(io.BytesIO(img_bytes), width=420, height=270))
+        if 'internal_resistance' in cycle_data.columns and cycle_data['internal_resistance'].notna().any():
+            img_bytes = _plot_cycle_life(cycle_data, 'internal_resistance', 'Internal Resistance (Ohm)',
+                                         'Internal Resistance vs Cycle Life')
+            elements.append(Image(io.BytesIO(img_bytes), width=420, height=270))
+            elements.append(Spacer(1, 6))
+
+        if 'temperature' in cycle_data.columns and cycle_data['temperature'].notna().any():
+            img_bytes = _plot_cycle_life(cycle_data, 'temperature', 'Temperature (°C)',
+                                         'Temperature vs Cycle Life')
+            elements.append(Image(io.BytesIO(img_bytes), width=420, height=270))
+            elements.append(Spacer(1, 6))
+
+        # Time-series plots
+        if time_series:
+            elements.append(Paragraph("Time-Series Plots (First/Middle/Last Cycles)", styles["Heading3"]))
+            cycle_nums = sorted(time_series.keys())
+            if len(cycle_nums) >= 3:
+                selected = [cycle_nums[0], cycle_nums[len(cycle_nums)//2], cycle_nums[-1]]
+            elif len(cycle_nums) >= 1:
+                selected = cycle_nums[:min(3, len(cycle_nums))]
+            else:
+                selected = []
+
+            if selected:
+                img_bytes = _plot_time_series(time_series, selected, "Current and Voltage Time-Series")
+                if img_bytes:
+                    elements.append(Image(io.BytesIO(img_bytes), width=500, height=300))
+                    elements.append(Spacer(1, 6))
+
+        # Degradation interpretations
+        if degradation_interps:
+            elements.append(Paragraph("Degradation Trend Analysis", styles["Heading3"]))
+            for di in degradation_interps:
+                elements.append(Paragraph("- " + di, styles["Normal"]))
+            elements.append(Spacer(1, 6))
+
+        elements.append(Spacer(1, 12))
+
+    # Voltage-capacity / ICA analysis (if available)
+    if features_by_group is not None:
+        elements.append(Paragraph("Dataset Quality & Richness", styles["Heading2"]))
+        if richness_notes:
+            for r in richness_notes:
+                elements.append(Paragraph("- " + r, styles["Normal"]))
+        else:
+            elements.append(Paragraph("No specific richness notes.", styles["Normal"]))
+        elements.append(Spacer(1, 6))
+
+        elements.append(Paragraph("Next-Step Suggestions", styles["Heading2"]))
+        if suggestions:
+            for s in suggestions:
+                elements.append(Paragraph("- " + s, styles["Normal"]))
+        else:
+            elements.append(Paragraph("No suggestions generated.", styles["Normal"]))
+        elements.append(Spacer(1, 6))
+
+        elements.append(Paragraph("Key Features by Curve", styles["Heading2"]))
+        table_data = [["Curve", "n_samples", "V Range (V)", "Capacity Range (Ah)",
+                       "ICA Peaks", "ICA Voltages (V)", "ICA Widths (V)", "Median |dV/dQ|"]]
+        for g, f in features_by_group.items():
+            table_data.append([
+                str(g),
+                f['n_samples'],
+                f"{f['voltage_range_V'][0]:.2f}–{f['voltage_range_V'][1]:.2f}",
+                f"{f['cap_range_Ah'][0]:.2f}–{f['cap_range_Ah'][1]:.2f}",
+                f['ica_peaks_count'],
+                ", ".join([f"{v:.3f}" for v in f['ica_peak_voltages_V']]) if f['ica_peak_voltages_V'] else "—",
+                ", ".join([f"{w:.3f}" for w in f['ica_peak_widths_V']]) if f['ica_peak_widths_V'] else "—",
+                f"{f['dVdQ_median_abs']:.4f}" if np.isfinite(f['dVdQ_median_abs']) else "—"
+            ])
+        tbl = Table(table_data, repeatRows=1)
+        tbl.setStyle(TableStyle([
+            ('BACKGROUND', (0,0), (-1,0), colors.lightgrey),
+            ('GRID', (0,0), (-1,-1), 0.25, colors.black),
+            ('FONTNAME', (0,0), (-1,0), 'Helvetica-Bold'),
+            ('FONTSIZE', (0,0), (-1,-1), 9),
+            ('ALIGN', (1,1), (-1,-1), 'CENTER')
+        ]))
+        elements.append(tbl)
+        elements.append(Spacer(1, 6))
+
+        elements.append(Paragraph("AI-style Interpretations", styles["Heading2"]))
+        if interps:
+            for i in interps:
+                elements.append(Paragraph("- " + i, styles["Normal"]))
+        else:
+            elements.append(Paragraph("No interpretations generated.", styles["Normal"]))
+        elements.append(Spacer(1, 6))
+
+        elements.append(Paragraph("Voltage-Capacity Visualizations", styles["Heading2"]))
+        if vc_all is not None and len(vc_all) > 0:
+            elements.append(Paragraph("Voltage vs Capacity", styles["Heading3"]))
+            img_bytes = _plot_to_bytes(vc_all, "Capacity_Ah", "Voltage vs Capacity")
+            elements.append(Image(io.BytesIO(img_bytes), width=420, height=270))
+        if ica_all is not None and len(ica_all) > 0:
+            elements.append(Paragraph("ICA: dQ/dV vs Voltage", styles["Heading3"]))
+            img_bytes = _plot_to_bytes(ica_all, "dQdV", "ICA: dQ/dV vs Voltage")
+            elements.append(Image(io.BytesIO(img_bytes), width=420, height=270))
 
     doc.build(elements)
     buffer.seek(0)
@@ -745,7 +1126,10 @@ with tab2:
         st.subheader("Upload a dataset")
         st.write(
             "Accepted: .csv (recommended) or .mat (if SciPy is available). "
-            "Columns: Voltage and Capacity_Ah (or Capacity_mAh). Optional: Cycle (e.g., Fresh/Aged)."
+            "Two formats supported:\n"
+            "1. **Cycle-level data**: Columns: cycle, discharge_capacity, internal_resistance (optional), temperature (optional). "
+            "Optional time-series: time_<cycle>, current_<cycle>, voltage_<cycle>.\n"
+            "2. **Voltage-Capacity curves**: Columns: Voltage, Capacity_Ah (or Capacity_mAh). Optional: Cycle (e.g., Fresh/Aged)."
         )
 
         up = st.file_uploader("Upload CSV or MAT file", type=["csv", "mat"])
@@ -759,168 +1143,616 @@ with tab2:
                     if not SCIPY_OK:
                         st.error("SciPy not available. Please upload a CSV for now.")
                     else:
-                        mat = loadmat(io.BytesIO(up.getvalue()))
-                        candidates = {k: np.squeeze(v) for k, v in mat.items()
-                                      if isinstance(v, np.ndarray) and v.size > 3}
-                        V = None; Q = None
-                        for key, arr in candidates.items():
-                            lk = key.lower()
-                            if V is None and ("volt" in lk or lk == "v"):
-                                V = arr
-                            if Q is None and ("cap" in lk or lk in ["q","capacity","capacity_ah","capacity_mah"]):
-                                Q = arr
-                        if V is None or Q is None:
-                            st.error("Could not find voltage/capacity arrays in .mat. Use CSV with Voltage, Capacity_Ah.")
-                        else:
-                            df = pd.DataFrame({"Voltage": V, "Capacity": Q})
+                        # Try loading with different options
+                        mat = None
+                        try:
+                            # First try with struct_as_record=True (default) to handle structures as dicts
+                            mat = loadmat(io.BytesIO(up.getvalue()), struct_as_record=True, squeeze_me=True)
+                        except:
+                            try:
+                                # Fallback to False
+                                mat = loadmat(io.BytesIO(up.getvalue()), struct_as_record=False, squeeze_me=True)
+                            except Exception as e:
+                                st.error(f"Error loading .mat file: {str(e)}")
+                                st.stop()
+                        
+                        # Helper function to extract data from MATLAB structures
+                        def extract_from_struct(obj, path="", depth=0):
+                            """Recursively extract arrays from MATLAB structures"""
+                            results = {}
+                            if depth > 10:  # Prevent infinite recursion
+                                return results
+                            try:
+                                if isinstance(obj, np.ndarray):
+                                    if obj.dtype.names:  # Structured array (like MatlabOpaque)
+                                        # First, try to extract from known MATLAB opaque fields
+                                        for fname in ['arr', 's0', 's1', 's2']:
+                                            if fname in obj.dtype.names:
+                                                field_data = obj[fname]
+                                                if isinstance(field_data, np.ndarray):
+                                                    if field_data.dtype == object and field_data.size > 0:
+                                                        # Object array - drill into each element
+                                                        for idx, item in enumerate(field_data.flat):
+                                                            if item is not None:
+                                                                results.update(extract_from_struct(item, f"{path}.{fname}_{idx}" if path else f"{fname}_{idx}", depth+1))
+                                                    elif field_data.size > 1 and field_data.dtype != object:
+                                                        # Numeric array
+                                                        results[f"{path}.{fname}" if path else fname] = np.squeeze(field_data)
+                                        
+                                        # Also extract all other fields recursively
+                                        for name in obj.dtype.names:
+                                            if name not in ['arr', 's0', 's1', 's2']:  # Skip already processed
+                                                field_data = obj[name]
+                                                if isinstance(field_data, np.ndarray):
+                                                    if field_data.dtype == object and field_data.size > 0:
+                                                        for idx, item in enumerate(field_data.flat):
+                                                            if item is not None:
+                                                                results.update(extract_from_struct(item, f"{path}.{name}_{idx}" if path else f"{name}_{idx}", depth+1))
+                                                    elif field_data.size > 1 and field_data.dtype != object:
+                                                        results[f"{path}.{name}" if path else name] = np.squeeze(field_data)
+                                    elif obj.dtype == object and obj.size > 0:
+                                        # Object array - extract each element
+                                        for idx, item in enumerate(obj.flat):
+                                            if item is not None:
+                                                results.update(extract_from_struct(item, f"{path}_{idx}" if path else f"item_{idx}", depth+1))
+                                    elif obj.size > 1 and obj.dtype != object:
+                                        # Regular numeric array
+                                        if path:
+                                            results[path] = np.squeeze(obj)
+                                elif isinstance(obj, dict):
+                                    for k, v in obj.items():
+                                        if not k.startswith('__'):
+                                            new_path = f"{path}.{k}" if path else k
+                                            results.update(extract_from_struct(v, new_path, depth+1))
+                                elif hasattr(obj, '_fieldnames'):  # MATLAB struct object
+                                    for field in obj._fieldnames:
+                                        field_data = getattr(obj, field, None)
+                                        if field_data is not None:
+                                            new_path = f"{path}.{field}" if path else field
+                                            results.update(extract_from_struct(field_data, new_path, depth+1))
+                                elif isinstance(obj, (list, tuple)):
+                                    for idx, item in enumerate(obj):
+                                        if item is not None:
+                                            results.update(extract_from_struct(item, f"{path}_{idx}" if path else f"item_{idx}", depth+1))
+                            except Exception as e:
+                                pass
+                            return results
+                        
+                        # Get all keys (including metadata for debugging)
+                        all_keys = list(mat.keys())
+                        non_meta_keys = [k for k in all_keys if not k.startswith('__')]
+                        
+                        # Extract all data from structures, including MatlabOpaque
+                        extracted_data = {}
+                        for key in non_meta_keys:
+                            if key in mat:
+                                extracted = extract_from_struct(mat[key], key)
+                                # Fix keys that start with "None" - replace with actual key name
+                                fixed_extracted = {}
+                                for ek, ev in extracted.items():
+                                    if ek.startswith("None"):
+                                        # Replace "None" with the actual key
+                                        new_key = ek.replace("None", key, 1)
+                                        fixed_extracted[new_key] = ev
+                                    else:
+                                        fixed_extracted[ek] = ev
+                                extracted_data.update(fixed_extracted)
+                        # Iterate over a static snapshot to avoid modifying the dict during iteration
+                        for key, value in list(extracted_data.items()):
+                            if isinstance(value, np.ndarray) and value.size > 1:
+                                # Store in a simplified key format (only add if new)
+                                simple_key = key.split('.')[-1] if '.' in key else key
+                                if simple_key not in extracted_data:
+                                    extracted_data[simple_key] = value
+                        
+                        # Also try to extract from any top-level opaque objects
+                        for key, value in mat.items():
+                            if not key.startswith('__'):
+                                # Check if it's a MatlabOpaque-like structure with s0, s1, s2, arr fields
+                                if isinstance(value, np.ndarray) and value.dtype.names:
+                                    opaque_fields = ['arr', 's0', 's1', 's2']
+                                    for opaque_field in opaque_fields:
+                                        if opaque_field in value.dtype.names:
+                                            field_data = value[opaque_field]
+                                            if isinstance(field_data, np.ndarray):
+                                                if field_data.dtype == object and field_data.size > 0:
+                                                    # It's an object array - drill into each element
+                                                    for idx, item in enumerate(field_data.flat):
+                                                        if item is not None:
+                                                            item_extracted = extract_from_struct(item, f"{key}_{opaque_field}_{idx}")
+                                                            extracted_data.update(item_extracted)
+                                                elif field_data.size > 1 and field_data.dtype != object:
+                                                    # Numeric array - store it
+                                                    extracted_data[f"{key}_{opaque_field}"] = np.squeeze(field_data)
+                        
+                        # Add extracted data to mat dictionary for easier access
+                        if extracted_data:
+                            mat.update(extracted_data)
+                        
+                        # Try to reconstruct DataFrame from .mat
+                        # Look for cycle-level data first
+                        cycle_data_mat = None
+                        if 'cycle' in mat or 'cycle_number' in mat:
+                            cycle_col = 'cycle' if 'cycle' in mat else 'cycle_number'
+                            cycle_data_mat = pd.DataFrame()
+                            cycle_data_mat['cycle'] = np.squeeze(mat[cycle_col])
+                            for key in ['discharge_capacity', 'capacity', 'discharge_cap']:
+                                if key in mat:
+                                    cycle_data_mat['discharge_capacity'] = np.squeeze(mat[key])
+                                    break
+                            for key in ['internal_resistance', 'ir', 'resistance']:
+                                if key in mat:
+                                    cycle_data_mat['internal_resistance'] = np.squeeze(mat[key])
+                                    break
+                            for key in ['temperature', 'temp']:
+                                if key in mat:
+                                    cycle_data_mat['temperature'] = np.squeeze(mat[key])
+                                    break
+                        
+                        # Fallback to voltage-capacity format
+                        if cycle_data_mat is None or len(cycle_data_mat) == 0:
+                            # Extract all arrays, including from structures and extracted_data
+                            all_arrays = {}
+                            
+                            # Start with extracted_data (from MatlabOpaque structures)
+                            if extracted_data:
+                                for key, value in extracted_data.items():
+                                    if isinstance(value, np.ndarray) and value.size > 1:
+                                        all_arrays[key] = np.squeeze(value)
+                                    # Also handle keys that contain "arr" - these might be the data
+                                    if "arr" in key.lower() and isinstance(value, np.ndarray):
+                                        # Try to extract nested arrays from object arrays
+                                        if value.dtype == object and value.size > 0:
+                                            for idx, item in enumerate(value.flat):
+                                                if isinstance(item, np.ndarray) and item.size > 1:
+                                                    all_arrays[f"{key}_item_{idx}"] = np.squeeze(item)
+                            
+                            # Also extract from mat dictionary
+                            for key, value in mat.items():
+                                if not key.startswith('__'):
+                                    try:
+                                        if isinstance(value, np.ndarray):
+                                            if value.dtype.names:  # Structured array
+                                                extracted = extract_from_struct(value, key)
+                                                all_arrays.update(extracted)
+                                            elif value.size > 1:
+                                                all_arrays[key] = np.squeeze(value)
+                                        elif isinstance(value, (list, tuple)):
+                                            for i, item in enumerate(value):
+                                                if isinstance(item, np.ndarray) and item.size > 1:
+                                                    all_arrays[f"{key}_{i}"] = np.squeeze(item)
+                                    except:
+                                        pass
+                            
+                            # Show available keys for debugging
+                            available_keys = list(all_arrays.keys())
+
+                            V = None
+                            Q = None
+
+                            # Priority 1: Try extracted_data first (from MatlabOpaque structures)
+                            if V is None or Q is None:
+                                for key, arr in extracted_data.items():
+                                    try:
+                                        if not isinstance(arr, np.ndarray) or arr.size < 2:
+                                            continue
+                                        arr_clean = np.squeeze(arr)
+                                        if arr_clean.size < 2 or not np.isfinite(arr_clean).any():
+                                            continue
+                                        min_val = np.nanmin(arr_clean)
+                                        max_val = np.nanmax(arr_clean)
+                                        lk = str(key).lower()
+
+                                        # Voltage: 0.5-6.5V range
+                                        if V is None and 0.5 <= min_val and max_val <= 6.5 and (max_val - min_val) > 0.1:
+                                            V = arr_clean
+                                        # Capacity: non-negative, has some range
+                                        elif Q is None and min_val >= 0 and max_val > 0.01:
+                                            Q = arr_clean
+                                    except Exception:
+                                        continue
+
+                            # Priority 2: Look at all_arrays with keyword matching
+                            for key, arr in all_arrays.items():
+                                try:
+                                    if not isinstance(arr, np.ndarray) or arr.size < 2:
+                                        continue
+                                    arr_clean = np.squeeze(arr)
+                                    if arr_clean.size < 2:
+                                        continue
+                                    if not np.isfinite(arr_clean).any():
+                                        continue
+
+                                    lk = str(key).lower()
+                                    min_val = np.nanmin(arr_clean)
+                                    max_val = np.nanmax(arr_clean)
+
+                                    # Voltage keyword matching
+                                    if V is None and any(vk in lk for vk in ["volt", "v_", "_v", "voltage", "v("]):
+                                        if 0.5 <= min_val and max_val <= 6.5:
+                                            V = arr_clean
+                                            continue
+
+                                    # Capacity keyword matching
+                                    if Q is None and any(ck in lk for ck in ["cap", "q_", "_q", "capacity", "mah", "ah", "discharge"]):
+                                        if min_val >= 0 and max_val > 0.01:
+                                            Q = arr_clean
+                                            continue
+                                except Exception:
+                                    continue
+
+                            # Priority 3: Brute-force heuristic - just use the two most different numeric ranges
+                            if V is None or Q is None:
+                                candidates = []
+                                for key, arr in list(all_arrays.items()) + list(extracted_data.items()):
+                                    try:
+                                        if not isinstance(arr, np.ndarray) or arr.size < 2:
+                                            continue
+                                        arr_clean = np.squeeze(arr)
+                                        if arr_clean.size < 2 or not np.isfinite(arr_clean).any():
+                                            continue
+                                        min_val = np.nanmin(arr_clean)
+                                        max_val = np.nanmax(arr_clean)
+                                        if max_val - min_val > 0.01:  # Has real range
+                                            candidates.append((key, arr_clean, min_val, max_val))
+                                    except Exception:
+                                        continue
+                                
+                                if len(candidates) >= 2:
+                                    # Sort by min value to separate voltage (higher min) from capacity (lower min)
+                                    candidates_sorted = sorted(candidates, key=lambda x: x[2])
+                                    if V is None:
+                                        # Take the one with the higher minimum value (likely voltage)
+                                        V = candidates_sorted[-1][1]
+                                    if Q is None:
+                                        # Take the one with the lower minimum value (likely capacity)
+                                        Q = candidates_sorted[0][1]
+                                elif len(candidates) == 1:
+                                    # Only one candidate - use it as first available
+                                    if V is None:
+                                        V = candidates[0][1]
+                                    elif Q is None:
+                                        Q = candidates[0][1]
+
+                            if V is None or Q is None:
+                                error_msg = "Could not find voltage/capacity arrays in .mat file.\n\n"
+                                if available_keys:
+                                    error_msg += f"**Available arrays found:** {', '.join(available_keys[:30])}"
+                                    if len(available_keys) > 30:
+                                        error_msg += f" (and {len(available_keys) - 30} more...)"
+
+                                error_msg += f"\n\n**Top-level keys in .mat file:** {', '.join(non_meta_keys[:30]) if non_meta_keys else 'None found'}"
+                                if len(non_meta_keys) > 30:
+                                    error_msg += f" (and {len(non_meta_keys) - 30} more...)"
+
+                                # Show details about what we found
+                                if non_meta_keys:
+                                    error_msg += "\n\n**Details:**\n"
+                                    for key in non_meta_keys[:10]:
+                                        try:
+                                            val = mat[key]
+                                            val_type = type(val).__name__
+                                            if isinstance(val, np.ndarray):
+                                                val_type += f" (shape: {val.shape}, dtype: {val.dtype})"
+                                                if getattr(val, 'dtype', None) is not None and getattr(val.dtype, 'names', None):
+                                                    val_type += f" [structured array with fields: {', '.join(val.dtype.names[:5])}]"
+                                            error_msg += f"- {key}: {val_type}\n"
+                                        except Exception:
+                                            error_msg += f"- {key}: <unreadable>\n"
+
+                                error_msg += "\n\n**Please ensure your .mat file contains arrays named with 'voltage'/'volt'/'v' and 'capacity'/'cap'/'q', or use CSV format.**"
+                                st.error(error_msg)
+                                st.stop()
+                            else:
+                                # Ensure same length
+                                min_len = min(len(V), len(Q))
+                                V = V[:min_len]
+                                Q = Q[:min_len]
+                                # Convert mAh to Ah if needed
+                                if np.nanmax(Q) > 100:
+                                    Q = Q / 1000.0
+                                df = pd.DataFrame({"Voltage": V, "Capacity": Q})
 
                 if df is not None:
-                    vcol, qcol, cyc = _standardize_columns(df)
-                    if vcol is None or qcol is None:
-                        st.error("Please include Voltage and Capacity_Ah (or Capacity_mAh).")
-                        st.stop()
-                    if cyc is None:
-                        df["_Cycle"] = "Curve1"
-                        cyc = "_Cycle"
-
-                    groups = list(df[cyc].astype(str).unique())
-                    features_by_group = {}
-                    vc_all_rows, ica_all_rows = [], []
-
-                    for g in groups:
-                        sub = df[df[cyc].astype(str) == g]
-                        V, Q = _prep_series(sub[vcol], sub[qcol])
-                        if len(V) < 5:
-                            continue
-                        dQdV, peak_info, dVdQ_med = _extract_features(V, Q)
-                        features_by_group[g] = {
-                            "n_samples": int(len(V)),
-                            "voltage_range_V": [float(np.nanmin(V)), float(np.nanmax(V))],
-                            "cap_range_Ah": [float(np.nanmin(Q)), float(np.nanmax(Q))],
-                            "ica_peaks_count": int(peak_info.get("n_peaks", 0)),
-                            "ica_peak_voltages_V": peak_info.get("voltages", []),
-                            "ica_peak_widths_V": peak_info.get("widths_V", []),
-                            "dVdQ_median_abs": dVdQ_med,
-                        }
-                        vc_all_rows.append(pd.DataFrame({"Voltage": V, "Capacity_Ah": Q, "Cycle": g}))
-                        ica_all_rows.append(pd.DataFrame({"Voltage": V, "dQdV": dQdV, "Cycle": g}))
-
-                    if not features_by_group:
-                        st.error("Not enough valid data points to analyze.")
-                        st.stop()
-
-                    # (1) DATASET QUALITY & RICHNESS
-                    st.markdown("### Dataset Quality & Richness")
-                    for g, f in features_by_group.items():
-                        st.write(
-                            f"{g} — {f['n_samples']} points | "
-                            f"V range: {f['voltage_range_V'][0]:.2f}–{f['voltage_range_V'][1]:.2f} V | "
-                            f"Capacity: {f['cap_range_Ah'][0]:.2f}–{f['cap_range_Ah'][1]:.2f} Ah | "
-                            f"ICA peaks: {f['ica_peaks_count']}"
-                        )
-
-                    richness_notes = []
-                    if len(features_by_group) >= 2:
-                        richness_notes.append("Multiple curves detected -> enables trend comparisons (fade, peak shifts, impedance).")
-                    else:
-                        richness_notes.append("Single curve detected -> add an aged or baseline curve for richer insights.")
-                    if any(f["n_samples"] < 30 for f in features_by_group.values()):
-                        richness_notes.append("Some curves have <30 points -> derivatives may be noisy; consider higher-resolution sampling.")
-                    if any(f["ica_peaks_count"] == 0 for f in features_by_group.values()):
-                        richness_notes.append("ICA shows few/no peaks -> may indicate smooth kinetics or insufficient resolution.")
-                    for rn in richness_notes:
-                        st.write("- " + rn)
-
-                    # (2) NEXT-STEP SUGGESTIONS
-                    st.markdown("### Next-Step Suggestions")
-                    suggestions = []
-                    if len(features_by_group) == 1:
-                        suggestions = [
-                            "Add a comparison curve (e.g., Fresh vs Aged, Cycle 10 vs Cycle 500) to quantify capacity fade and ICA peak shifts.",
-                            "Track ICA peak positions/widths across cycles to infer LLI vs LAM vs impedance growth.",
-                            "Include IR/temperature columns (if available) to correlate electro-thermal behavior."
-                        ]
-                    else:
-                        suggestions = [
-                            "Quantify fade: compute % capacity change between earliest and latest curves.",
-                            "Track ICA peak shifts (mV) and broadening (mV) -> LLI and impedance indicators.",
-                            "Build a simple regression using extracted features to predict end-of-life or rate performance.",
-                            "If you have cycle index/time, add it to the dataset for richer trend modeling."
-                        ]
-                    for s in suggestions:
-                        st.write("- " + s)
-
-                    st.divider()
-                    do_plots = st.button("Visualize recommended plots", type="primary")
-
-                    if do_plots:
-                        st.markdown("### Visualizations")
-                        vc_all = pd.concat(vc_all_rows, ignore_index=True)
-                        ica_all = pd.concat(ica_all_rows, ignore_index=True)
-
-                        vc_chart = (
-                            alt.Chart(vc_all)
-                            .mark_line()
-                            .encode(
-                                x=alt.X("Voltage:Q", title="Voltage (V)"),
-                                y=alt.Y("Capacity_Ah:Q", title="Capacity (Ah)"),
-                                color=alt.Color("Cycle:N", title="Curve")
+                    # Check if this is cycle-level data
+                    is_cycle_level = _detect_cycle_level_data(df)
+                    
+                    if is_cycle_level:
+                        # Process cycle-level data
+                        cycle_data = _parse_cycle_level_data(df)
+                        time_series = _parse_time_series_columns(df)
+                        
+                        if cycle_data is None or len(cycle_data) == 0:
+                            st.error("Could not parse cycle-level data. Please check column names.")
+                            st.stop()
+                        
+                        # Extract cycle features
+                        cycle_features = _extract_cycle_features(cycle_data)
+                        degradation_interps = _generate_degradation_interpretations(cycle_features, cycle_data)
+                        
+                        # Display cycle-level analysis
+                        st.markdown("### Cycle-Life Analysis")
+                        st.write(f"**Number of cycles:** {cycle_features.get('n_cycles', 'N/A')}")
+                        if 'capacity_initial_Ah' in cycle_features and np.isfinite(cycle_features['capacity_initial_Ah']):
+                            st.write(f"**Initial capacity:** {cycle_features['capacity_initial_Ah']:.3f} Ah")
+                        if 'capacity_final_Ah' in cycle_features and np.isfinite(cycle_features['capacity_final_Ah']):
+                            st.write(f"**Final capacity:** {cycle_features['capacity_final_Ah']:.3f} Ah")
+                        if 'total_fade_percent' in cycle_features and np.isfinite(cycle_features['total_fade_percent']):
+                            st.write(f"**Total fade:** {cycle_features['total_fade_percent']:.2f}%")
+                        if 'fade_rate_percent_per_cycle' in cycle_features and np.isfinite(cycle_features['fade_rate_percent_per_cycle']):
+                            st.write(f"**Fade rate:** {cycle_features['fade_rate_percent_per_cycle']:.4f}% per cycle")
+                        
+                        st.divider()
+                        do_plots = st.button("Visualize cycle-life plots", type="primary")
+                        
+                        if do_plots:
+                            st.markdown("### Cycle-Life Visualizations")
+                            
+                            # Capacity vs cycle
+                            if 'discharge_capacity' in cycle_data.columns:
+                                cap_chart = alt.Chart(cycle_data.dropna(subset=['cycle', 'discharge_capacity'])).mark_line(point=True).encode(
+                                    x=alt.X("cycle:Q", title="Cycle Number"),
+                                    y=alt.Y("discharge_capacity:Q", title="Discharge Capacity (Ah)")
+                                ).properties(title="Discharge Capacity vs Cycle Life", width=600, height=300)
+                                st.altair_chart(cap_chart, use_container_width=True)
+                            
+                            # IR vs cycle
+                            if 'internal_resistance' in cycle_data.columns and cycle_data['internal_resistance'].notna().any():
+                                ir_chart = alt.Chart(cycle_data.dropna(subset=['cycle', 'internal_resistance'])).mark_line(point=True).encode(
+                                    x=alt.X("cycle:Q", title="Cycle Number"),
+                                    y=alt.Y("internal_resistance:Q", title="Internal Resistance (Ohm)")
+                                ).properties(title="Internal Resistance vs Cycle Life", width=600, height=300)
+                                st.altair_chart(ir_chart, use_container_width=True)
+                            
+                            # Temperature vs cycle
+                            if 'temperature' in cycle_data.columns and cycle_data['temperature'].notna().any():
+                                temp_chart = alt.Chart(cycle_data.dropna(subset=['cycle', 'temperature'])).mark_line(point=True).encode(
+                                    x=alt.X("cycle:Q", title="Cycle Number"),
+                                    y=alt.Y("temperature:Q", title="Temperature (°C)")
+                                ).properties(title="Temperature vs Cycle Life", width=600, height=300)
+                                st.altair_chart(temp_chart, use_container_width=True)
+                            
+                            # Time-series plots
+                            if time_series:
+                                st.markdown("### Time-Series Plots (First/Middle/Last Cycles)")
+                                cycle_nums = sorted(time_series.keys())
+                                if len(cycle_nums) >= 3:
+                                    selected = [cycle_nums[0], cycle_nums[len(cycle_nums)//2], cycle_nums[-1]]
+                                elif len(cycle_nums) >= 1:
+                                    selected = cycle_nums[:min(3, len(cycle_nums))]
+                                else:
+                                    selected = []
+                                
+                                for cycle_num in selected:
+                                    if cycle_num in time_series:
+                                        ts = time_series[cycle_num]
+                                        time = ts.get('time', None)
+                                        current = ts.get('current', None)
+                                        voltage = ts.get('voltage', None)
+                                        
+                                        if time is not None and (current is not None or voltage is not None):
+                                            st.markdown(f"**Cycle {cycle_num}**")
+                                            cols_ts = st.columns(2)
+                                            if current is not None:
+                                                ts_df = pd.DataFrame({'time': time, 'current': current})
+                                                ts_df = ts_df.dropna()
+                                                if len(ts_df) > 0:
+                                                    with cols_ts[0]:
+                                                        curr_chart = alt.Chart(ts_df).mark_line().encode(
+                                                            x=alt.X("time:Q", title="Time (s)"),
+                                                            y=alt.Y("current:Q", title="Current (A)")
+                                                        ).properties(title=f"Cycle {cycle_num} - Current", width=300, height=200)
+                                                        st.altair_chart(curr_chart, use_container_width=True)
+                                            if voltage is not None:
+                                                ts_df = pd.DataFrame({'time': time, 'voltage': voltage})
+                                                ts_df = ts_df.dropna()
+                                                if len(ts_df) > 0:
+                                                    with cols_ts[1]:
+                                                        volt_chart = alt.Chart(ts_df).mark_line().encode(
+                                                            x=alt.X("time:Q", title="Time (s)"),
+                                                            y=alt.Y("voltage:Q", title="Voltage (V)")
+                                                        ).properties(title=f"Cycle {cycle_num} - Voltage", width=300, height=200)
+                                                        st.altair_chart(volt_chart, use_container_width=True)
+                            
+                            st.markdown("### Degradation Trend Analysis")
+                            for di in degradation_interps:
+                                st.write("- " + di)
+                            
+                            # Export .mat file
+                            if SCIPY_OK:
+                                mat_buf = io.BytesIO()
+                                mat_data = {
+                                    'cycle': cycle_data['cycle'].values.astype(float),
+                                    'discharge_capacity': cycle_data['discharge_capacity'].values.astype(float),
+                                }
+                                if 'internal_resistance' in cycle_data.columns:
+                                    mat_data['internal_resistance'] = cycle_data['internal_resistance'].values.astype(float)
+                                if 'temperature' in cycle_data.columns:
+                                    mat_data['temperature'] = cycle_data['temperature'].values.astype(float)
+                                
+                                # Add time-series data if available
+                                if time_series:
+                                    for cycle_num, ts in time_series.items():
+                                        if 'time' in ts:
+                                            mat_data[f'time_{cycle_num}'] = ts['time'].astype(float)
+                                        if 'current' in ts:
+                                            mat_data[f'current_{cycle_num}'] = ts['current'].astype(float)
+                                        if 'voltage' in ts:
+                                            mat_data[f'voltage_{cycle_num}'] = ts['voltage'].astype(float)
+                                
+                                savemat(mat_buf, mat_data)
+                                mat_buf.seek(0)
+                                
+                                st.download_button(
+                                    "Download processed data (.mat)",
+                                    data=mat_buf.getvalue(),
+                                    file_name="BatteryLab_cycle_data.mat",
+                                    mime="application/octet-stream"
+                                )
+                            
+                            # PDF Download
+                            pdf_bytes = generate_pdf_report(
+                                cycle_data=cycle_data,
+                                cycle_features=cycle_features,
+                                degradation_interps=degradation_interps,
+                                time_series=time_series
                             )
-                            .properties(title="Voltage vs Capacity")
-                        )
-
-                        ica_chart = (
-                            alt.Chart(ica_all)
-                            .mark_line()
-                            .encode(
-                                x=alt.X("Voltage:Q", title="Voltage (V)"),
-                                y=alt.Y("dQdV:Q", title="dQ/dV (Ah/V)"),
-                                color=alt.Color("Cycle:N", title="Curve")
+                            st.download_button(
+                                "Download Full Report (PDF)",
+                                data=pdf_bytes,
+                                file_name="BatteryLab_cycle_analysis_report.pdf",
+                                mime="application/pdf"
                             )
-                            .properties(title="ICA: dQ/dV vs Voltage")
-                        )
+                        else:
+                            st.info("Click **Visualize cycle-life plots** to see charts and download the PDF report.")
+                    else:
+                        # Original voltage-capacity processing
+                        vcol, qcol, cyc = _standardize_columns(df)
+                        if vcol is None or qcol is None:
+                            st.error("Please include Voltage and Capacity_Ah (or Capacity_mAh).")
+                            st.stop()
+                        if cyc is None:
+                            df["_Cycle"] = "Curve1"
+                            cyc = "_Cycle"
 
-                        c1, c2 = st.columns(2)
-                        with c1:
-                            st.altair_chart(vc_chart, use_container_width=True)
-                        with c2:
-                            st.altair_chart(ica_chart, use_container_width=True)
+                        groups = list(df[cyc].astype(str).unique())
+                        features_by_group = {}
+                        vc_all_rows, ica_all_rows = [], []
 
-                        st.markdown("### Key Features by Curve")
-                        st.write(features_by_group)
+                        for g in groups:
+                            sub = df[df[cyc].astype(str) == g]
+                            V, Q = _prep_series(sub[vcol], sub[qcol])
+                            if len(V) < 5:
+                                continue
+                            dQdV, peak_info, dVdQ_med = _extract_features(V, Q)
+                            features_by_group[g] = {
+                                "n_samples": int(len(V)),
+                                "voltage_range_V": [float(np.nanmin(V)), float(np.nanmax(V))],
+                                "cap_range_Ah": [float(np.nanmin(Q)), float(np.nanmax(Q))],
+                                "ica_peaks_count": int(peak_info.get("n_peaks", 0)),
+                                "ica_peak_voltages_V": peak_info.get("voltages", []),
+                                "ica_peak_widths_V": peak_info.get("widths_V", []),
+                                "dVdQ_median_abs": dVdQ_med,
+                            }
+                            vc_all_rows.append(pd.DataFrame({"Voltage": V, "Capacity_Ah": Q, "Cycle": g}))
+                            ica_all_rows.append(pd.DataFrame({"Voltage": V, "dQdV": dQdV, "Cycle": g}))
 
-                        st.markdown("### AI-style Interpretations (dynamic)")
-                        interps = []
+                        if not features_by_group:
+                            st.error("Not enough valid data points to analyze.")
+                            st.stop()
+
+                        # (1) DATASET QUALITY & RICHNESS
+                        st.markdown("### Dataset Quality & Richness")
+                        for g, f in features_by_group.items():
+                            st.write(
+                                f"{g} — {f['n_samples']} points | "
+                                f"V range: {f['voltage_range_V'][0]:.2f}–{f['voltage_range_V'][1]:.2f} V | "
+                                f"Capacity: {f['cap_range_Ah'][0]:.2f}–{f['cap_range_Ah'][1]:.2f} Ah | "
+                                f"ICA peaks: {f['ica_peaks_count']}"
+                            )
+
+                        richness_notes = []
+                        if len(features_by_group) >= 2:
+                            richness_notes.append("Multiple curves detected -> enables trend comparisons (fade, peak shifts, impedance).")
+                        else:
+                            richness_notes.append("Single curve detected -> add an aged or baseline curve for richer insights.")
+                        if any(f["n_samples"] < 30 for f in features_by_group.values()):
+                            richness_notes.append("Some curves have <30 points -> derivatives may be noisy; consider higher-resolution sampling.")
+                        if any(f["ica_peaks_count"] == 0 for f in features_by_group.values()):
+                            richness_notes.append("ICA shows few/no peaks -> may indicate smooth kinetics or insufficient resolution.")
+                        for rn in richness_notes:
+                            st.write("- " + rn)
+
+                        # (2) NEXT-STEP SUGGESTIONS
+                        st.markdown("### Next-Step Suggestions")
+                        suggestions = []
                         if len(features_by_group) == 1:
-                            interps = [
-                                "Distinct ICA peaks often indicate well-defined phase transitions.",
-                                "Broadening of ICA peaks over time is a common sign of rising impedance.",
-                                "Compare this curve to an earlier/later cycle to quantify fade and peak shifts."
+                            suggestions = [
+                                "Add a comparison curve (e.g., Fresh vs Aged, Cycle 10 vs Cycle 500) to quantify capacity fade and ICA peak shifts.",
+                                "Track ICA peak positions/widths across cycles to infer LLI vs LAM vs impedance growth.",
+                                "Include IR/temperature columns (if available) to correlate electro-thermal behavior."
                             ]
                         else:
-                            gnames = list(features_by_group.keys())[:2]
-                            fA, fB = features_by_group[gnames[0]], features_by_group[gnames[1]]
-                            featA = {
-                                "cap_range_Ah": fA["cap_range_Ah"],
-                                "ica_peak_voltages_V": fA["ica_peak_voltages_V"],
-                                "ica_peak_widths_V": fA["ica_peak_widths_V"],
-                                "dVdQ_median_abs": fA["dVdQ_median_abs"],
-                            }
-                            featB = {
-                                "cap_range_Ah": fB["cap_range_Ah"],
-                                "ica_peak_voltages_V": fB["ica_peak_voltages_V"],
-                                "ica_peak_widths_V": fB["ica_peak_widths_V"],
-                                "dVdQ_median_abs": fB["dVdQ_median_abs"],
-                            }
-                            interps = _compare_two_sets(gnames[0], featA, gnames[1], featB)
-                        for b in interps:
-                            st.write("- " + b)
+                            suggestions = [
+                                "Quantify fade: compute % capacity change between earliest and latest curves.",
+                                "Track ICA peak shifts (mV) and broadening (mV) -> LLI and impedance indicators.",
+                                "Build a simple regression using extracted features to predict end-of-life or rate performance.",
+                                "If you have cycle index/time, add it to the dataset for richer trend modeling."
+                            ]
+                        for s in suggestions:
+                            st.write("- " + s)
 
-                        # ---------------------------
-                        # Export: .mat data + .py repro script
-                        # ---------------------------
-                        def _build_repro_script_py(default_mat_name="BatteryLab_analytics_data.mat"):
-                            return f"""# Reproduce BatteryLAB analytics plots
+                        st.divider()
+                        do_plots = st.button("Visualize recommended plots", type="primary")
+
+                        if do_plots:
+                            st.markdown("### Visualizations")
+                            vc_all = pd.concat(vc_all_rows, ignore_index=True)
+                            ica_all = pd.concat(ica_all_rows, ignore_index=True)
+
+                            vc_chart = (
+                                alt.Chart(vc_all)
+                                .mark_line()
+                                .encode(
+                                    x=alt.X("Voltage:Q", title="Voltage (V)"),
+                                    y=alt.Y("Capacity_Ah:Q", title="Capacity (Ah)"),
+                                    color=alt.Color("Cycle:N", title="Curve")
+                                )
+                                .properties(title="Voltage vs Capacity")
+                            )
+
+                            ica_chart = (
+                                alt.Chart(ica_all)
+                                .mark_line()
+                                .encode(
+                                    x=alt.X("Voltage:Q", title="Voltage (V)"),
+                                    y=alt.Y("dQdV:Q", title="dQ/dV (Ah/V)"),
+                                    color=alt.Color("Cycle:N", title="Curve")
+                                )
+                                .properties(title="ICA: dQ/dV vs Voltage")
+                            )
+
+                            c1, c2 = st.columns(2)
+                            with c1:
+                                st.altair_chart(vc_chart, use_container_width=True)
+                            with c2:
+                                st.altair_chart(ica_chart, use_container_width=True)
+
+                            st.markdown("### Key Features by Curve")
+                            st.write(features_by_group)
+
+                            st.markdown("### AI-style Interpretations (dynamic)")
+                            interps = []
+                            if len(features_by_group) == 1:
+                                interps = [
+                                    "Distinct ICA peaks often indicate well-defined phase transitions.",
+                                    "Broadening of ICA peaks over time is a common sign of rising impedance.",
+                                    "Compare this curve to an earlier/later cycle to quantify fade and peak shifts."
+                                ]
+                            else:
+                                gnames = list(features_by_group.keys())[:2]
+                                fA, fB = features_by_group[gnames[0]], features_by_group[gnames[1]]
+                                featA = {
+                                    "cap_range_Ah": fA["cap_range_Ah"],
+                                    "ica_peak_voltages_V": fA["ica_peak_voltages_V"],
+                                    "ica_peak_widths_V": fA["ica_peak_widths_V"],
+                                    "dVdQ_median_abs": fA["dVdQ_median_abs"],
+                                }
+                                featB = {
+                                    "cap_range_Ah": fB["cap_range_Ah"],
+                                    "ica_peak_voltages_V": fB["ica_peak_voltages_V"],
+                                    "ica_peak_widths_V": fB["ica_peak_widths_V"],
+                                    "dVdQ_median_abs": fB["dVdQ_median_abs"],
+                                }
+                                interps = _compare_two_sets(gnames[0], featA, gnames[1], featB)
+                            for b in interps:
+                                st.write("- " + b)
+
+                            # ---------------------------
+                            # Export: .mat data + .py repro script
+                            # ---------------------------
+                            def _build_repro_script_py(default_mat_name="BatteryLab_analytics_data.mat"):
+                                return f"""# Reproduce BatteryLAB analytics plots
 import sys
 import numpy as np
 import matplotlib.pyplot as plt
@@ -969,82 +1801,82 @@ plt.tight_layout()
 plt.show()
 """
 
-                        # Build .mat payload (handles arbitrary # of curves)
-                        vc_cat = vc_all["Cycle"].astype("category")
-                        ica_cat = ica_all["Cycle"].astype("category")
+                            # Build .mat payload (handles arbitrary # of curves)
+                            vc_cat = vc_all["Cycle"].astype("category")
+                            ica_cat = ica_all["Cycle"].astype("category")
 
-                        vc_cycle_idx = vc_cat.cat.codes.to_numpy().astype(np.int32)
-                        vc_cycle_names = np.array(vc_cat.cat.categories.tolist(), dtype=object)
+                            vc_cycle_idx = vc_cat.cat.codes.to_numpy().astype(np.int32)
+                            vc_cycle_names = np.array(vc_cat.cat.categories.tolist(), dtype=object)
 
-                        ica_cycle_idx = ica_cat.cat.codes.to_numpy().astype(np.int32)
-                        ica_cycle_names = np.array(ica_cat.cat.categories.tolist(), dtype=object)
+                            ica_cycle_idx = ica_cat.cat.codes.to_numpy().astype(np.int32)
+                            ica_cycle_names = np.array(ica_cat.cat.categories.tolist(), dtype=object)
 
-                        # Prepare binary buffers for both files
-                        py_script_text = _build_repro_script_py()
-                        py_bytes = py_script_text.encode("utf-8")
+                            # Prepare binary buffers for both files
+                            py_script_text = _build_repro_script_py()
+                            py_bytes = py_script_text.encode("utf-8")
 
-                        if SCIPY_OK:
-                            mat_buf = io.BytesIO()
-                            savemat(mat_buf, {
-                                # VC table
-                                "vc_voltage":      vc_all["Voltage"].to_numpy().astype(float),
-                                "vc_capacity_ah":  vc_all["Capacity_Ah"].to_numpy().astype(float),
-                                "vc_cycle_idx":    vc_cycle_idx,
-                                "vc_cycle_names":  vc_cycle_names,
-                                # ICA table
-                                "ica_voltage":     ica_all["Voltage"].to_numpy().astype(float),
-                                "ica_dqdv":        ica_all["dQdV"].to_numpy().astype(float),
-                                "ica_cycle_idx":   ica_cycle_idx,
-                                "ica_cycle_names": ica_cycle_names,
-                            })
-                            mat_buf.seek(0)
-                        else:
-                            mat_buf = None  # SciPy not available
-
-                        c_dl1, c_dl2 = st.columns(2)
-                        with c_dl1:
-                            if SCIPY_OK and mat_buf is not None:
-                                st.download_button(
-                                    "Download analytics data (.mat)",
-                                    data=mat_buf.getvalue(),
-                                    file_name="BatteryLab_analytics_data.mat",
-                                    mime="application/octet-stream"
-                                )
+                            if SCIPY_OK:
+                                mat_buf = io.BytesIO()
+                                savemat(mat_buf, {
+                                    # VC table
+                                    "vc_voltage":      vc_all["Voltage"].to_numpy().astype(float),
+                                    "vc_capacity_ah":  vc_all["Capacity_Ah"].to_numpy().astype(float),
+                                    "vc_cycle_idx":    vc_cycle_idx,
+                                    "vc_cycle_names":  vc_cycle_names,
+                                    # ICA table
+                                    "ica_voltage":     ica_all["Voltage"].to_numpy().astype(float),
+                                    "ica_dqdv":        ica_all["dQdV"].to_numpy().astype(float),
+                                    "ica_cycle_idx":   ica_cycle_idx,
+                                    "ica_cycle_names": ica_cycle_names,
+                                })
+                                mat_buf.seek(0)
                             else:
-                                st.info("Install SciPy on the server to enable `.mat` export (pip install scipy).")
+                                mat_buf = None  # SciPy not available
 
-                        with c_dl2:
+                            c_dl1, c_dl2 = st.columns(2)
+                            with c_dl1:
+                                if SCIPY_OK and mat_buf is not None:
+                                    st.download_button(
+                                        "Download analytics data (.mat)",
+                                        data=mat_buf.getvalue(),
+                                        file_name="BatteryLab_analytics_data.mat",
+                                        mime="application/octet-stream"
+                                    )
+                                else:
+                                    st.info("Install SciPy on the server to enable `.mat` export (pip install scipy).")
+
+                            with c_dl2:
+                                st.download_button(
+                                    "Download repro plot script (.py)",
+                                    data=py_bytes,
+                                    file_name="repro_analytics_plots.py",
+                                    mime="text/x-python"
+                                )
+
+                            # PDF Download
+                            pdf_bytes = generate_pdf_report(
+                                features_by_group=features_by_group,
+                                richness_notes=richness_notes,
+                                suggestions=suggestions,
+                                interps=interps,
+                                vc_all=vc_all,
+                                ica_all=ica_all
+                            )
                             st.download_button(
-                                "Download repro plot script (.py)",
-                                data=py_bytes,
-                                file_name="repro_analytics_plots.py",
-                                mime="text/x-python"
+                                "Download Full Report (PDF)",
+                                data=pdf_bytes,
+                                file_name="BatteryLab_analytics_report.pdf",
+                                mime="application/pdf"
                             )
 
-                        # PDF Download
-                        pdf_bytes = generate_pdf_report(
-                            features_by_group=features_by_group,
-                            richness_notes=richness_notes,
-                            suggestions=suggestions,
-                            interps=interps,
-                            vc_all=vc_all,
-                            ica_all=ica_all
-                        )
-                        st.download_button(
-                            "Download Full Report (PDF)",
-                            data=pdf_bytes,
-                            file_name="BatteryLab_analytics_report.pdf",
-                            mime="application/pdf"
-                        )
-
-                        # Store for Copilot (analytics cache)
-                        st.session_state.latest_analytics = {
-                            "features_by_group": features_by_group,
-                            "vc_all": vc_all,
-                            "ica_all": ica_all,
-                        }
-                    else:
-                        st.info("Click **Visualize recommended plots** to render charts, then see Key Features, interpretations, and download the PDF report.")
+                            # Store for Copilot (analytics cache)
+                            st.session_state.latest_analytics = {
+                                "features_by_group": features_by_group,
+                                "vc_all": vc_all,
+                                "ica_all": ica_all,
+                            }
+                        else:
+                            st.info("Click **Visualize recommended plots** to render charts, then see Key Features, interpretations, and download the PDF report.")
         else:
             st.info("Upload a CSV with Voltage and Capacity_Ah (or Capacity_mAh). Optional: Cycle column. .mat is supported if SciPy is available.")
 

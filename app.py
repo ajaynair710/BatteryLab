@@ -4,11 +4,17 @@
 
 import io
 import json
+import warnings
 import numpy as np
 import pandas as pd
 import streamlit as st
 import altair as alt
 import random, time  # for Copilot typing effect
+
+# Suppress numpy divide/nan warnings for gradient calculations
+warnings.filterwarnings("ignore", category=RuntimeWarning, message=".*divide by zero.*")
+warnings.filterwarnings("ignore", category=RuntimeWarning, message=".*invalid value.*")
+warnings.filterwarnings("ignore", category=RuntimeWarning, message=".*All-NaN slice.*")
 
 # PDF export
 from reportlab.lib.pagesizes import A4
@@ -78,12 +84,15 @@ def _detect_cycle_level_data(df: pd.DataFrame):
     """Detect if data is in cycle-level format (one row per cycle)"""
     cols_l = [c.lower() for c in df.columns]
     has_cycle = any(c in ["cycle", "cycle_number", "cycle_idx"] for c in cols_l)
-    has_discharge_cap = any("discharge_capacity" in c or "discharge_cap" in c or 
-                           (c in ["capacity", "cap", "q"] and "discharge" in " ".join(cols_l)) 
-                           for c in cols_l)
-    has_ir = any("internal_resistance" in c or "ir" == c or "resistance" in c 
-                for c in cols_l)
-    has_temp = any("temperature" in c or "temp" == c for c in cols_l)
+    # Accept QDischarge, discharge_capacity, discharge_cap, capacity, cap, q
+    has_discharge_cap = any(
+        "discharge_capacity" in c or "discharge_cap" in c or "qdischarge" in c or
+        (c in ["capacity", "cap", "q"] and "discharge" in " ".join(cols_l)) or c == "qdischarge"
+        for c in cols_l)
+    # Accept IR, internal_resistance, resistance
+    has_ir = any("internal_resistance" in c or c == "ir" or "resistance" in c or c == "ir" for c in cols_l)
+    # Accept temperature, temp, tmax, tavg, tmin
+    has_temp = any("temperature" in c or c == "temp" or c in ["tmax", "tavg", "tmin"] for c in cols_l)
     return has_cycle and (has_discharge_cap or has_ir or has_temp)
 
 def _parse_cycle_level_data(df: pd.DataFrame):
@@ -100,27 +109,30 @@ def _parse_cycle_level_data(df: pd.DataFrame):
     # Find discharge capacity
     cap_col = None
     for i, c in enumerate(cols_l):
-        if "discharge_capacity" in c or ("capacity" in c and "discharge" in " ".join(cols_l[:i+1])):
+        if "discharge_capacity" in c or "discharge_cap" in c or "qdischarge" in c or ("capacity" in c and "discharge" in " ".join(cols_l[:i+1])):
             cap_col = df.columns[i]
             break
     if cap_col is None:
         for i, c in enumerate(cols_l):
-            if c in ["capacity", "cap", "q", "discharge_cap"]:
+            if c in ["capacity", "cap", "q", "discharge_cap", "qdischarge"]:
                 cap_col = df.columns[i]
                 break
     
     # Find internal resistance
     ir_col = None
     for i, c in enumerate(cols_l):
-        if "internal_resistance" in c or c == "ir" or ("resistance" in c and "internal" in " ".join(cols_l[:i+1])):
+        if "internal_resistance" in c or c == "ir" or "resistance" in c:
             ir_col = df.columns[i]
             break
     
-    # Find temperature
+    # Find temperature (accept temperature, temp, tmax, tavg, tmin; prefer tavg, then tmax, then tmin)
     temp_col = None
-    for i, c in enumerate(cols_l):
-        if "temperature" in c or c == "temp":
-            temp_col = df.columns[i]
+    for pref in ["tavg", "temperature", "temp", "tmax", "tmin"]:
+        for i, c in enumerate(cols_l):
+            if c == pref or pref in c:
+                temp_col = df.columns[i]
+                break
+        if temp_col:
             break
     
     if cycle_col is None or cap_col is None:
@@ -1454,6 +1466,57 @@ with tab2:
                                 df = pd.DataFrame({"Voltage": V, "Capacity": Q})
 
                 if df is not None:
+                    # Show detected columns / arrays to the user for transparency
+                    try:
+                        st.markdown("### Detected Columns / Arrays")
+                        cols = list(df.columns)
+                        # Show basic table of column names and dtypes
+                        col_types = [(c, str(df[c].dtype)) for c in cols]
+                        st.write(pd.DataFrame(col_types, columns=["column", "dtype"]))
+
+                        # Map likely roles for cycle-level datasets
+                        cols_l = [c.lower() for c in cols]
+                        role_map = {}
+                        # cycle
+                        for cand in ["cycle", "cycle_number", "cycle_idx"]:
+                            if cand in cols_l:
+                                role_map['cycle'] = cols[cols_l.index(cand)]
+                                break
+                        # discharge capacity candidates
+                        for cand in ["qdischarge", "discharge_capacity", "discharge_cap", "qdis", "q_discharge"]:
+                            if cand in cols_l:
+                                role_map['discharge_capacity'] = cols[cols_l.index(cand)]
+                                break
+                        # common capacity names
+                        if 'discharge_capacity' not in role_map:
+                            for cand in ['capacity', 'cap', 'q', 'q_ah', 'capacity_ah', 'qcharge', 'qcharge']:
+                                if cand in cols_l:
+                                    role_map['discharge_capacity'] = cols[cols_l.index(cand)]
+                                    break
+                        # IR
+                        for cand in ['internal_resistance', 'ir', 'resistance']:
+                            if cand in cols_l:
+                                role_map['internal_resistance'] = cols[cols_l.index(cand)]
+                                break
+                        # Temperature
+                        for cand in ['tavg', 'temperature', 'temp', 'tmax', 'tmin']:
+                            if cand in cols_l:
+                                role_map['temperature'] = cols[cols_l.index(cand)]
+                                break
+
+                        # Time-series columns (time_<cycle>, current_<cycle>, voltage_<cycle>)
+                        ts_cols = [c for c in cols if c.lower().startswith('time_') or c.lower().startswith('current_') or c.lower().startswith('voltage_')]
+                        if ts_cols:
+                            role_map['time_series_example'] = ts_cols[:6]
+
+                        if role_map:
+                            st.markdown("**Inferred roles:**")
+                            for k, v in role_map.items():
+                                st.write(f"- {k}: {v}")
+                        else:
+                            st.info("No standard cycle-level roles inferred from column names. The app will attempt heuristic detection.")
+                    except Exception:
+                        pass
                     # Check if this is cycle-level data
                     is_cycle_level = _detect_cycle_level_data(df)
                     
@@ -1486,31 +1549,124 @@ with tab2:
                         do_plots = st.button("Visualize cycle-life plots", type="primary")
                         
                         if do_plots:
-                            st.markdown("### Cycle-Life Visualizations")
+                            st.markdown("### Cycle-Life Visualizations (4 Plots)")
                             
-                            # Capacity vs cycle
-                            if 'discharge_capacity' in cycle_data.columns:
-                                cap_chart = alt.Chart(cycle_data.dropna(subset=['cycle', 'discharge_capacity'])).mark_line(point=True).encode(
-                                    x=alt.X("cycle:Q", title="Cycle Number"),
-                                    y=alt.Y("discharge_capacity:Q", title="Discharge Capacity (Ah)")
-                                ).properties(title="Discharge Capacity vs Cycle Life", width=600, height=300)
-                                st.altair_chart(cap_chart, use_container_width=True)
+                            # Create 2x2 grid layout
+                            col1, col2 = st.columns(2, gap="medium")
                             
-                            # IR vs cycle
-                            if 'internal_resistance' in cycle_data.columns and cycle_data['internal_resistance'].notna().any():
-                                ir_chart = alt.Chart(cycle_data.dropna(subset=['cycle', 'internal_resistance'])).mark_line(point=True).encode(
-                                    x=alt.X("cycle:Q", title="Cycle Number"),
-                                    y=alt.Y("internal_resistance:Q", title="Internal Resistance (Ohm)")
-                                ).properties(title="Internal Resistance vs Cycle Life", width=600, height=300)
-                                st.altair_chart(ir_chart, use_container_width=True)
+                            # Plot 1: Capacity vs cycle
+                            with col1:
+                                if 'discharge_capacity' in cycle_data.columns:
+                                    cap_data = cycle_data.dropna(subset=['cycle', 'discharge_capacity'])
+                                    if len(cap_data) > 0:
+                                        cap_chart = alt.Chart(cap_data).mark_line(point=True, pointSize=6).encode(
+                                            x=alt.X("cycle:Q", title="Cycle Number"),
+                                            y=alt.Y("discharge_capacity:Q", title="Discharge Capacity (Ah)"),
+                                            tooltip=['cycle:Q', 'discharge_capacity:Q']
+                                        ).properties(title="1. Discharge Capacity vs Cycle Life", width=450, height=300)
+                                        st.altair_chart(cap_chart, width='stretch')
+                                    else:
+                                        st.info("No capacity data available")
+                                else:
+                                    st.info("Discharge capacity column not found")
                             
-                            # Temperature vs cycle
-                            if 'temperature' in cycle_data.columns and cycle_data['temperature'].notna().any():
-                                temp_chart = alt.Chart(cycle_data.dropna(subset=['cycle', 'temperature'])).mark_line(point=True).encode(
-                                    x=alt.X("cycle:Q", title="Cycle Number"),
-                                    y=alt.Y("temperature:Q", title="Temperature (°C)")
-                                ).properties(title="Temperature vs Cycle Life", width=600, height=300)
-                                st.altair_chart(temp_chart, use_container_width=True)
+                            # Plot 2: IR vs cycle
+                            with col2:
+                                if 'internal_resistance' in cycle_data.columns and cycle_data['internal_resistance'].notna().any():
+                                    ir_data = cycle_data.dropna(subset=['cycle', 'internal_resistance'])
+                                    if len(ir_data) > 0:
+                                        ir_chart = alt.Chart(ir_data).mark_line(point=True, pointSize=6, color='#FF6B6B').encode(
+                                            x=alt.X("cycle:Q", title="Cycle Number"),
+                                            y=alt.Y("internal_resistance:Q", title="Internal Resistance (Ohm)"),
+                                            tooltip=['cycle:Q', 'internal_resistance:Q']
+                                        ).properties(title="2. Internal Resistance vs Cycle Life", width=450, height=300)
+                                        st.altair_chart(ir_chart, width='stretch')
+                                    else:
+                                        st.info("No IR data available")
+                                else:
+                                    st.info("Internal resistance column not found")
+                            
+                            # Plot 3: Temperature vs cycle
+                            col3, col4 = st.columns(2, gap="medium")
+                            with col3:
+                                if 'temperature' in cycle_data.columns and cycle_data['temperature'].notna().any():
+                                    temp_data = cycle_data.dropna(subset=['cycle', 'temperature'])
+                                    if len(temp_data) > 0:
+                                        temp_chart = alt.Chart(temp_data).mark_line(point=True, pointSize=6, color='#FFA500').encode(
+                                            x=alt.X("cycle:Q", title="Cycle Number"),
+                                            y=alt.Y("temperature:Q", title="Temperature (°C)"),
+                                            tooltip=['cycle:Q', 'temperature:Q']
+                                        ).properties(title="3. Temperature vs Cycle Life", width=450, height=300)
+                                        st.altair_chart(temp_chart, width='stretch')
+                                    else:
+                                        st.info("No temperature data available")
+                                else:
+                                    st.info("Temperature column not found")
+                            
+                            # Plot 4: Current & Voltage Time-Series
+                            with col4:
+                                if time_series:
+                                    cycle_nums = sorted(time_series.keys())
+                                    if len(cycle_nums) > 0:
+                                        # Select cycles for time-series display
+                                        if len(cycle_nums) >= 3:
+                                            selected_cycles = [cycle_nums[0], cycle_nums[len(cycle_nums)//2], cycle_nums[-1]]
+                                            selected_label = f"First, Middle, Last cycles: {', '.join(map(str, selected_cycles))}"
+                                        elif len(cycle_nums) >= 1:
+                                            selected_cycles = cycle_nums[:min(3, len(cycle_nums))]
+                                            selected_label = f"Cycles: {', '.join(map(str, selected_cycles))}"
+                                        else:
+                                            selected_cycles = []
+                                            selected_label = "No cycles available"
+                                        
+                                        ts_charts = []
+                                        for cycle_num in selected_cycles:
+                                            if cycle_num in time_series:
+                                                ts = time_series[cycle_num]
+                                                time = ts.get('time', None)
+                                                current = ts.get('current', None)
+                                                voltage = ts.get('voltage', None)
+                                                
+                                                # Combine current and voltage data
+                                                if time is not None and (current is not None or voltage is not None):
+                                                    ts_data = []
+                                                    if current is not None:
+                                                        valid = np.isfinite(time) & np.isfinite(current)
+                                                        if np.any(valid):
+                                                            ts_data.append(pd.DataFrame({
+                                                                'time': time[valid],
+                                                                'value': current[valid],
+                                                                'metric': 'Current (A)',
+                                                                'cycle': cycle_num
+                                                            }))
+                                                    if voltage is not None:
+                                                        valid = np.isfinite(time) & np.isfinite(voltage)
+                                                        if np.any(valid):
+                                                            ts_data.append(pd.DataFrame({
+                                                                'time': time[valid],
+                                                                'value': voltage[valid],
+                                                                'metric': 'Voltage (V)',
+                                                                'cycle': cycle_num
+                                                            }))
+                                                    if ts_data:
+                                                        ts_charts.append(pd.concat(ts_data, ignore_index=True))
+                                        
+                                        if ts_charts:
+                                            combined_ts = pd.concat(ts_charts, ignore_index=True)
+                                            ts_chart = alt.Chart(combined_ts).mark_line().encode(
+                                                x=alt.X("time:Q", title="Time (s)"),
+                                                y=alt.Y("value:Q", title="Value"),
+                                                color=alt.Color("metric:N", title="Metric"),
+                                                detail='cycle:N',
+                                                tooltip=['time:Q', 'value:Q', 'metric:N', 'cycle:N']
+                                            ).properties(title=f"4. Current & Voltage Profile\n({selected_label})", width=450, height=300)
+                                            st.altair_chart(ts_chart, width='stretch')
+                                        else:
+                                            st.info("No valid time-series data found")
+                                    else:
+                                        st.info("No time-series data available")
+                                else:
+                                    st.info("Time-series data not provided in dataset")
                             
                             # Time-series plots
                             if time_series:
@@ -1542,7 +1698,7 @@ with tab2:
                                                             x=alt.X("time:Q", title="Time (s)"),
                                                             y=alt.Y("current:Q", title="Current (A)")
                                                         ).properties(title=f"Cycle {cycle_num} - Current", width=300, height=200)
-                                                        st.altair_chart(curr_chart, use_container_width=True)
+                                                        st.altair_chart(curr_chart, width='stretch')
                                             if voltage is not None:
                                                 ts_df = pd.DataFrame({'time': time, 'voltage': voltage})
                                                 ts_df = ts_df.dropna()
@@ -1552,7 +1708,7 @@ with tab2:
                                                             x=alt.X("time:Q", title="Time (s)"),
                                                             y=alt.Y("voltage:Q", title="Voltage (V)")
                                                         ).properties(title=f"Cycle {cycle_num} - Voltage", width=300, height=200)
-                                                        st.altair_chart(volt_chart, use_container_width=True)
+                                                        st.altair_chart(volt_chart, width='stretch')
                             
                             st.markdown("### Degradation Trend Analysis")
                             for di in degradation_interps:
@@ -1714,9 +1870,9 @@ with tab2:
 
                             c1, c2 = st.columns(2)
                             with c1:
-                                st.altair_chart(vc_chart, use_container_width=True)
+                                st.altair_chart(vc_chart, width='stretch')
                             with c2:
-                                st.altair_chart(ica_chart, use_container_width=True)
+                                st.altair_chart(ica_chart, width='stretch')
 
                             st.markdown("### Key Features by Curve")
                             st.write(features_by_group)

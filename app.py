@@ -1430,6 +1430,14 @@ with tab2:
                                 if key in mat:
                                     cycle_data_mat['temperature'] = np.squeeze(mat[key])
                                     break
+                            for key in ['voltage', 'v', 'volt']:
+                                if key in mat:
+                                    cycle_data_mat['voltage'] = np.squeeze(mat[key])
+                                    break
+                            for key in ['current', 'i', 'curr']:
+                                if key in mat:
+                                    cycle_data_mat['current'] = np.squeeze(mat[key])
+                                    break
                             
                             # Add ALL other valid arrays to cycle_data_mat
                             for key, arr in all_arrays.items():
@@ -1508,6 +1516,10 @@ with tab2:
                                 all_cycle_nums.update(ir_arrays.keys())
                             if temp_arrays:
                                 all_cycle_nums.update(temp_arrays.keys())
+                            if voltage_arrays:
+                                all_cycle_nums.update(voltage_arrays.keys())
+                            if current_arrays:
+                                all_cycle_nums.update(current_arrays.keys())
                             
                             # Also look for summary arrays (not indexed by cycle)
                             # These might be per-cycle summary metrics
@@ -1588,6 +1600,12 @@ with tab2:
                                     if cycle_num in temp_arrays:
                                         temp_arr = temp_arrays[cycle_num]
                                         cycle_summaries[cycle_num]['temp'] = np.nanmean(temp_arr) if np.any(np.isfinite(temp_arr)) else np.nan
+                                    if cycle_num in voltage_arrays:
+                                        volt_arr = voltage_arrays[cycle_num]
+                                        cycle_summaries[cycle_num]['voltage'] = np.nanmean(volt_arr) if np.any(np.isfinite(volt_arr)) else np.nan
+                                    if cycle_num in current_arrays:
+                                        curr_arr = current_arrays[cycle_num]
+                                        cycle_summaries[cycle_num]['current'] = np.nanmean(curr_arr) if np.any(np.isfinite(curr_arr)) else np.nan
                                 
                                 # Build DataFrame from cycle summaries
                                 if cycle_summaries and any('capacity' in s for s in cycle_summaries.values()):
@@ -1595,13 +1613,19 @@ with tab2:
                                         'cycle': sorted_cycles,
                                         'discharge_capacity': [cycle_summaries.get(c, {}).get('capacity', np.nan) for c in sorted_cycles],
                                         'internal_resistance': [cycle_summaries.get(c, {}).get('ir', np.nan) for c in sorted_cycles],
-                                        'temperature': [cycle_summaries.get(c, {}).get('temp', np.nan) for c in sorted_cycles]
+                                        'temperature': [cycle_summaries.get(c, {}).get('temp', np.nan) for c in sorted_cycles],
+                                        'voltage': [cycle_summaries.get(c, {}).get('voltage', np.nan) for c in sorted_cycles],
+                                        'current': [cycle_summaries.get(c, {}).get('current', np.nan) for c in sorted_cycles]
                                     })
-                                    # Ensure internal_resistance and temperature columns exist even if all NaN
+                                    # Ensure internal_resistance, temperature, voltage, and current columns exist even if all NaN
                                     if 'internal_resistance' not in cycle_data_mat.columns:
                                         cycle_data_mat['internal_resistance'] = np.nan
                                     if 'temperature' not in cycle_data_mat.columns:
                                         cycle_data_mat['temperature'] = np.nan
+                                    if 'voltage' not in cycle_data_mat.columns:
+                                        cycle_data_mat['voltage'] = np.nan
+                                    if 'current' not in cycle_data_mat.columns:
+                                        cycle_data_mat['current'] = np.nan
                                     df = cycle_data_mat
                         
                         # Fallback to voltage-capacity format

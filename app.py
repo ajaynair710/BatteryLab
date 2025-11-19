@@ -327,6 +327,76 @@ def _extract_cycle_features(cycle_data: pd.DataFrame):
     
     return features
 
+def _assess_data_quality_and_richness(cycle_data: pd.DataFrame, time_series: dict, cycle_features: dict):
+    """Assess data quality and richness for cycle-level battery data"""
+    quality_notes = []
+    richness_notes = []
+    
+    # Assess cycle count
+    n_cycles = cycle_features.get('n_cycles', 0)
+    if n_cycles < 10:
+        quality_notes.append("**Low cycle count** (<10 cycles): Limited degradation trend visibility")
+    elif n_cycles < 50:
+        quality_notes.append("**Moderate cycle count** (10-50 cycles): Good for initial degradation analysis")
+    else:
+        quality_notes.append("**High cycle count** (>50 cycles): Excellent for comprehensive lifetime analysis")
+    
+    # Assess capacity data completeness
+    cap_valid = cycle_data['discharge_capacity'].notna().sum() if 'discharge_capacity' in cycle_data.columns else 0
+    if cap_valid > 0:
+        cap_completeness = (cap_valid / n_cycles * 100) if n_cycles > 0 else 0
+        if cap_completeness < 50:
+            quality_notes.append(f"**Capacity data incomplete** ({cap_completeness:.1f}% coverage)")
+        else:
+            quality_notes.append(f"**Capacity data available** ({cap_valid}/{n_cycles} cycles, {cap_completeness:.1f}% coverage)")
+    
+    # Assess internal resistance data
+    ir_valid = cycle_data['internal_resistance'].notna().sum() if 'internal_resistance' in cycle_data.columns else 0
+    if ir_valid > 0:
+        ir_completeness = (ir_valid / n_cycles * 100) if n_cycles > 0 else 0
+        quality_notes.append(f"**Internal resistance data available** ({ir_valid}/{n_cycles} cycles, {ir_completeness:.1f}% coverage)")
+        richness_notes.append("Internal resistance enables power fade analysis and impedance growth tracking")
+    else:
+        quality_notes.append("**Internal resistance data missing**: Power fade analysis not possible")
+    
+    # Assess temperature data
+    temp_valid = cycle_data['temperature'].notna().sum() if 'temperature' in cycle_data.columns else 0
+    if temp_valid > 0:
+        temp_completeness = (temp_valid / n_cycles * 100) if n_cycles > 0 else 0
+        quality_notes.append(f"**Temperature data available** ({temp_valid}/{n_cycles} cycles, {temp_completeness:.1f}% coverage)")
+        richness_notes.append("Temperature data enables thermal analysis and correlation with performance degradation")
+    else:
+        quality_notes.append("**Temperature data missing**: Thermal-electrochemical coupling analysis not possible")
+    
+    # Assess time-series data
+    if time_series and len(time_series) > 0:
+        ts_cycles = len(time_series)
+        quality_notes.append(f"**Time-series data available** ({ts_cycles} cycles with current/voltage profiles)")
+        richness_notes.append(f"Time-series profiles enable voltage-capacity curve analysis, dQ/dV, and detailed cycle behavior")
+        if ts_cycles < n_cycles * 0.1:
+            richness_notes.append(f"Only {ts_cycles} cycles have time-series data - consider extracting more for richer analysis")
+    else:
+        quality_notes.append("**Time-series data missing**: Voltage-capacity curve and dQ/dV analysis not possible")
+    
+    # Overall richness assessment
+    param_count = sum([
+        1 if cap_valid > 0 else 0,
+        1 if ir_valid > 0 else 0,
+        1 if temp_valid > 0 else 0,
+        1 if time_series and len(time_series) > 0 else 0
+    ])
+    
+    if param_count >= 4:
+        richness_notes.insert(0, "**Rich dataset**: Contains all 4 key parameters (capacity, IR, temperature, time-series)")
+    elif param_count >= 3:
+        richness_notes.insert(0, "**Good dataset**: Contains 3 out of 4 key parameters")
+    elif param_count >= 2:
+        richness_notes.insert(0, "**Basic dataset**: Contains 2 out of 4 key parameters")
+    else:
+        richness_notes.insert(0, "**Limited dataset**: Contains only 1 key parameter")
+    
+    return quality_notes, richness_notes
+
 def _generate_degradation_interpretations(cycle_features: dict, cycle_data: pd.DataFrame):
     """Generate AI-style interpretations of degradation trends"""
     interps = []
@@ -444,19 +514,38 @@ def _plot_time_series(time_series: dict, cycle_nums: list, title_prefix: str):
         current = ts.get('current', None)
         voltage = ts.get('voltage', None)
         
+        # Ensure time is a numpy array
+        if time is not None:
+            if isinstance(time, (list, tuple)):
+                time = np.array(time)
+        
         if time is not None and current is not None:
-            valid = np.isfinite(time) & np.isfinite(current)
+            # Ensure current is a numpy array and match length with time
+            if isinstance(current, (list, tuple)):
+                current = np.array(current)
+            # Match lengths
+            min_len = min(len(time), len(current))
+            time_aligned = time[:min_len]
+            current_aligned = current[:min_len]
+            valid = np.isfinite(time_aligned) & np.isfinite(current_aligned)
             if np.any(valid):
-                axes[idx, 0].plot(time[valid], current[valid], 'b-', linewidth=1.5)
+                axes[idx, 0].plot(time_aligned[valid], current_aligned[valid], 'b-', linewidth=1.5)
                 axes[idx, 0].set_xlabel("Time (s)")
                 axes[idx, 0].set_ylabel("Current (A)")
                 axes[idx, 0].set_title(f"Cycle {cycle_num} - Current")
                 axes[idx, 0].grid(True, alpha=0.3)
         
         if time is not None and voltage is not None:
-            valid = np.isfinite(time) & np.isfinite(voltage)
+            # Ensure voltage is a numpy array and match length with time
+            if isinstance(voltage, (list, tuple)):
+                voltage = np.array(voltage)
+            # Match lengths
+            min_len = min(len(time), len(voltage))
+            time_aligned = time[:min_len]
+            voltage_aligned = voltage[:min_len]
+            valid = np.isfinite(time_aligned) & np.isfinite(voltage_aligned)
             if np.any(valid):
-                axes[idx, 1].plot(time[valid], voltage[valid], 'r-', linewidth=1.5)
+                axes[idx, 1].plot(time_aligned[valid], voltage_aligned[valid], 'r-', linewidth=1.5)
                 axes[idx, 1].set_xlabel("Time (s)")
                 axes[idx, 1].set_ylabel("Voltage (V)")
                 axes[idx, 1].set_title(f"Cycle {cycle_num} - Voltage")
@@ -1281,9 +1370,50 @@ with tab2:
                         if extracted_data:
                             mat.update(extracted_data)
                         
+                        # Collect ALL arrays from the .mat file for comprehensive DataFrame
+                        all_arrays = {}
+                        
+                        # Start with extracted_data (from MatlabOpaque structures)
+                        if extracted_data:
+                            for key, value in extracted_data.items():
+                                if isinstance(value, np.ndarray) and value.size > 1:
+                                    all_arrays[key] = np.squeeze(value)
+                                # Also handle keys that contain "arr" - these might be the data
+                                if "arr" in key.lower() and isinstance(value, np.ndarray):
+                                    # Try to extract nested arrays from object arrays
+                                    if value.dtype == object and value.size > 0:
+                                        for idx, item in enumerate(value.flat):
+                                            if isinstance(item, np.ndarray) and item.size > 1:
+                                                all_arrays[f"{key}_item_{idx}"] = np.squeeze(item)
+                        
+                        # Also extract from mat dictionary
+                        for key, value in mat.items():
+                            if not key.startswith('__'):
+                                try:
+                                    if isinstance(value, np.ndarray):
+                                        if value.dtype.names:  # Structured array
+                                            extracted = extract_from_struct(value, key)
+                                            all_arrays.update(extracted)
+                                        elif value.size > 1:
+                                            all_arrays[key] = np.squeeze(value)
+                                    elif isinstance(value, (list, tuple)):
+                                        for i, item in enumerate(value):
+                                            if isinstance(item, np.ndarray) and item.size > 1:
+                                                all_arrays[f"{key}_{i}"] = np.squeeze(item)
+                                except:
+                                    pass
+                        
+                        # Show available keys for debugging
+                        available_keys = list(all_arrays.keys())
+                        # Store in session state for access in display section
+                        st.session_state.mat_all_arrays = all_arrays
+                        st.session_state.mat_available_keys = available_keys
+
                         # Try to reconstruct DataFrame from .mat
                         # Look for cycle-level data first
                         cycle_data_mat = None
+                        
+                        # Check for direct cycle column
                         if 'cycle' in mat or 'cycle_number' in mat:
                             cycle_col = 'cycle' if 'cycle' in mat else 'cycle_number'
                             cycle_data_mat = pd.DataFrame()
@@ -1300,45 +1430,182 @@ with tab2:
                                 if key in mat:
                                     cycle_data_mat['temperature'] = np.squeeze(mat[key])
                                     break
+                            
+                            # Add ALL other valid arrays to cycle_data_mat
+                            for key, arr in all_arrays.items():
+                                try:
+                                    if not isinstance(arr, np.ndarray):
+                                        continue
+                                    arr_clean = np.squeeze(arr)
+                                    # Skip if already in DataFrame or not a valid 1D array
+                                    if key in cycle_data_mat.columns or arr_clean.ndim != 1:
+                                        continue
+                                    # Only add if length matches the cycle column
+                                    if len(arr_clean) == len(cycle_data_mat):
+                                        # Clean column name (remove dots and special chars)
+                                        clean_key = key.split('.')[-1].replace(' ', '_').replace('-', '_')
+                                        if clean_key not in cycle_data_mat.columns:
+                                            cycle_data_mat[clean_key] = arr_clean
+                                except:
+                                    pass
+                            
+                            # If we have cycle-level data, use it
+                            if len(cycle_data_mat) > 0:
+                                df = cycle_data_mat
+                        
+                        # If no direct cycle column found, try to extract from array names (e.g., cycles.discharge_capacity_0, cycles.discharge_capacity_1)
+                        if df is None:
+                            import re
+                            # Look for patterns like cycles.*_N or cycles.*[N] where N is cycle number
+                            cycle_arrays = {}
+                            capacity_arrays = {}
+                            ir_arrays = {}
+                            temp_arrays = {}
+                            voltage_arrays = {}
+                            current_arrays = {}
+                            time_arrays = {}
+                            
+                            for key, arr in all_arrays.items():
+                                try:
+                                    if not isinstance(arr, np.ndarray):
+                                        continue
+                                    arr_clean = np.squeeze(arr)
+                                    if arr_clean.ndim != 1 or arr_clean.size < 2:
+                                        continue
+                                    
+                                    key_lower = key.lower()
+                                    
+                                    # Extract cycle number from key (look for _N or [N] at end)
+                                    cycle_match = re.search(r'_(\d+)$|\[(\d+)\]$', key)
+                                    if cycle_match:
+                                        cycle_num = int(cycle_match.group(1) or cycle_match.group(2))
+                                        
+                                        # Categorize arrays by type
+                                        if 'cycle' in key_lower and ('number' in key_lower or 'num' in key_lower or 'idx' in key_lower):
+                                            cycle_arrays[cycle_num] = arr_clean
+                                        elif 'capacity' in key_lower or ('discharge' in key_lower and 'q' in key_lower):
+                                            capacity_arrays[cycle_num] = arr_clean
+                                        elif 'resistance' in key_lower or key_lower.endswith('_ir') or key_lower == 'ir':
+                                            ir_arrays[cycle_num] = arr_clean
+                                        elif 'temperature' in key_lower or 'temp' in key_lower:
+                                            temp_arrays[cycle_num] = arr_clean
+                                        elif 'voltage' in key_lower or key_lower.startswith('v_') or key_lower.endswith('_v'):
+                                            voltage_arrays[cycle_num] = arr_clean
+                                        elif 'current' in key_lower or key_lower.startswith('i_') or key_lower.endswith('_i'):
+                                            current_arrays[cycle_num] = arr_clean
+                                        elif 'time' in key_lower or key_lower.startswith('t_'):
+                                            time_arrays[cycle_num] = arr_clean
+                                except:
+                                    pass
+                            
+                            # If we found cycle-indexed arrays, try to build cycle-level DataFrame
+                            all_cycle_nums = set()
+                            if cycle_arrays:
+                                all_cycle_nums.update(cycle_arrays.keys())
+                            if capacity_arrays:
+                                all_cycle_nums.update(capacity_arrays.keys())
+                            if ir_arrays:
+                                all_cycle_nums.update(ir_arrays.keys())
+                            if temp_arrays:
+                                all_cycle_nums.update(temp_arrays.keys())
+                            
+                            # Also look for summary arrays (not indexed by cycle)
+                            # These might be per-cycle summary metrics
+                            summary_capacity = None
+                            summary_cycles = None
+                            summary_ir = None
+                            summary_temp = None
+                            summary_voltage = None
+                            summary_current = None
+                            
+                            for key, arr in all_arrays.items():
+                                try:
+                                    key_lower = key.lower()
+                                    arr_clean = np.squeeze(arr)
+                                    if not isinstance(arr_clean, np.ndarray) or arr_clean.ndim != 1:
+                                        continue
+                                    
+                                    # Look for summary/aggregate arrays (no cycle index in name)
+                                    if re.search(r'_\d+$|\[\d+\]$', key):
+                                        continue  # Skip cycle-indexed arrays here
+                                    
+                                    if 'cycle' in key_lower and ('number' in key_lower or 'num' in key_lower or 'idx' in key_lower) and len(arr_clean) > 1:
+                                        summary_cycles = arr_clean
+                                    elif ('discharge' in key_lower or 'capacity' in key_lower) and len(arr_clean) > 1 and np.nanmax(arr_clean) < 1000:
+                                        summary_capacity = arr_clean
+                                    elif ('resistance' in key_lower or key_lower.endswith('_ir')) and len(arr_clean) > 1:
+                                        summary_ir = arr_clean
+                                    elif ('temperature' in key_lower or 'temp' in key_lower) and len(arr_clean) > 1:
+                                        summary_temp = arr_clean
+                                    elif ('voltage' in key_lower or key_lower.startswith('v_') or key_lower.endswith('_v')) and len(arr_clean) > 1:
+                                        # Check if it's a reasonable voltage range (0.5-6.5V)
+                                        if np.nanmin(arr_clean) >= 0.5 and np.nanmax(arr_clean) <= 6.5:
+                                            summary_voltage = arr_clean
+                                    elif ('current' in key_lower or key_lower.startswith('i_') or key_lower.endswith('_i')) and len(arr_clean) > 1:
+                                        summary_current = arr_clean
+                                except:
+                                    pass
+                            
+                            # Build cycle-level DataFrame from summary arrays if they match in length
+                            if summary_cycles is not None and summary_capacity is not None:
+                                if len(summary_cycles) == len(summary_capacity):
+                                    cycle_data_mat = pd.DataFrame()
+                                    cycle_data_mat['cycle'] = summary_cycles
+                                    cycle_data_mat['discharge_capacity'] = summary_capacity
+                                    
+                                    # Initialize with NaN, then fill if data exists
+                                    cycle_data_mat['internal_resistance'] = np.nan
+                                    cycle_data_mat['temperature'] = np.nan
+                                    cycle_data_mat['voltage'] = np.nan
+                                    cycle_data_mat['current'] = np.nan
+                                    
+                                    if summary_ir is not None and len(summary_ir) == len(summary_cycles):
+                                        cycle_data_mat['internal_resistance'] = summary_ir
+                                    if summary_temp is not None and len(summary_temp) == len(summary_cycles):
+                                        cycle_data_mat['temperature'] = summary_temp
+                                    if summary_voltage is not None and len(summary_voltage) == len(summary_cycles):
+                                        cycle_data_mat['voltage'] = summary_voltage
+                                    if summary_current is not None and len(summary_current) == len(summary_cycles):
+                                        cycle_data_mat['current'] = summary_current
+                                    
+                                    df = cycle_data_mat
+                            
+                            # If we still don't have cycle data, try extracting from cycles.* structure
+                            if df is None and all_cycle_nums:
+                                # Sort cycles and extract per-cycle summary (e.g., mean capacity per cycle)
+                                sorted_cycles = sorted(all_cycle_nums)
+                                cycle_summaries = {}
+                                
+                                for cycle_num in sorted_cycles:
+                                    cycle_summaries[cycle_num] = {}
+                                    if cycle_num in capacity_arrays:
+                                        cap_arr = capacity_arrays[cycle_num]
+                                        # Use mean or last value as cycle summary
+                                        cycle_summaries[cycle_num]['capacity'] = np.nanmean(cap_arr) if np.any(np.isfinite(cap_arr)) else np.nan
+                                    if cycle_num in ir_arrays:
+                                        ir_arr = ir_arrays[cycle_num]
+                                        cycle_summaries[cycle_num]['ir'] = np.nanmean(ir_arr) if np.any(np.isfinite(ir_arr)) else np.nan
+                                    if cycle_num in temp_arrays:
+                                        temp_arr = temp_arrays[cycle_num]
+                                        cycle_summaries[cycle_num]['temp'] = np.nanmean(temp_arr) if np.any(np.isfinite(temp_arr)) else np.nan
+                                
+                                # Build DataFrame from cycle summaries
+                                if cycle_summaries and any('capacity' in s for s in cycle_summaries.values()):
+                                    cycle_data_mat = pd.DataFrame({
+                                        'cycle': sorted_cycles,
+                                        'discharge_capacity': [cycle_summaries.get(c, {}).get('capacity', np.nan) for c in sorted_cycles],
+                                        'internal_resistance': [cycle_summaries.get(c, {}).get('ir', np.nan) for c in sorted_cycles],
+                                        'temperature': [cycle_summaries.get(c, {}).get('temp', np.nan) for c in sorted_cycles]
+                                    })
+                                    # Ensure internal_resistance and temperature columns exist even if all NaN
+                                    if 'internal_resistance' not in cycle_data_mat.columns:
+                                        cycle_data_mat['internal_resistance'] = np.nan
+                                    if 'temperature' not in cycle_data_mat.columns:
+                                        cycle_data_mat['temperature'] = np.nan
+                                    df = cycle_data_mat
                         
                         # Fallback to voltage-capacity format
-                        if cycle_data_mat is None or len(cycle_data_mat) == 0:
-                            # Extract all arrays, including from structures and extracted_data
-                            all_arrays = {}
-                            
-                            # Start with extracted_data (from MatlabOpaque structures)
-                            if extracted_data:
-                                for key, value in extracted_data.items():
-                                    if isinstance(value, np.ndarray) and value.size > 1:
-                                        all_arrays[key] = np.squeeze(value)
-                                    # Also handle keys that contain "arr" - these might be the data
-                                    if "arr" in key.lower() and isinstance(value, np.ndarray):
-                                        # Try to extract nested arrays from object arrays
-                                        if value.dtype == object and value.size > 0:
-                                            for idx, item in enumerate(value.flat):
-                                                if isinstance(item, np.ndarray) and item.size > 1:
-                                                    all_arrays[f"{key}_item_{idx}"] = np.squeeze(item)
-                            
-                            # Also extract from mat dictionary
-                            for key, value in mat.items():
-                                if not key.startswith('__'):
-                                    try:
-                                        if isinstance(value, np.ndarray):
-                                            if value.dtype.names:  # Structured array
-                                                extracted = extract_from_struct(value, key)
-                                                all_arrays.update(extracted)
-                                            elif value.size > 1:
-                                                all_arrays[key] = np.squeeze(value)
-                                        elif isinstance(value, (list, tuple)):
-                                            for i, item in enumerate(value):
-                                                if isinstance(item, np.ndarray) and item.size > 1:
-                                                    all_arrays[f"{key}_{i}"] = np.squeeze(item)
-                                    except:
-                                        pass
-                            
-                            # Show available keys for debugging
-                            available_keys = list(all_arrays.keys())
-
+                        if df is None:
                             V = None
                             Q = None
 
@@ -1463,16 +1730,121 @@ with tab2:
                                 # Convert mAh to Ah if needed
                                 if np.nanmax(Q) > 100:
                                     Q = Q / 1000.0
-                                df = pd.DataFrame({"Voltage": V, "Capacity": Q})
+                                
+                                # Build DataFrame with ALL arrays that match the length
+                                df_data = {"Voltage": V, "Capacity": Q}
+                                for key, arr in all_arrays.items():
+                                    try:
+                                        if not isinstance(arr, np.ndarray):
+                                            continue
+                                        arr_clean = np.squeeze(arr)
+                                        # Skip if not 1D or already added
+                                        if arr_clean.ndim != 1 or key in df_data or key.lower() in ['voltage', 'capacity']:
+                                            continue
+                                        # Only add if length matches
+                                        if len(arr_clean) == min_len:
+                                            clean_key = key.split('.')[-1].replace(' ', '_').replace('-', '_')
+                                            # Skip if already exists
+                                            if clean_key not in df_data:
+                                                # Check if it's numeric
+                                                if np.issubdtype(arr_clean.dtype, np.number):
+                                                    df_data[clean_key] = arr_clean
+                                    except:
+                                        pass
+                                
+                                df = pd.DataFrame(df_data)
+                        
+                        # Extract time-series data from all_arrays if available
+                        # Look for patterns like cycles.*voltage*_N, cycles.*current*_N, cycles.*time*_N
+                        if df is not None and 'all_arrays' in locals():
+                            time_series_from_arrays = {}
+                            import re
+                            
+                            for key, arr in all_arrays.items():
+                                try:
+                                    if not isinstance(arr, np.ndarray):
+                                        continue
+                                    arr_clean = np.squeeze(arr)
+                                    if arr_clean.ndim != 1 or arr_clean.size < 2:
+                                        continue
+                                    
+                                    key_lower = key.lower()
+                                    
+                                    # Extract cycle number from key
+                                    cycle_match = re.search(r'_(\d+)$|\[(\d+)\]$', key)
+                                    if cycle_match:
+                                        cycle_num = int(cycle_match.group(1) or cycle_match.group(2))
+                                        
+                                        if cycle_num not in time_series_from_arrays:
+                                            time_series_from_arrays[cycle_num] = {}
+                                        
+                                        # Categorize by type
+                                        if 'time' in key_lower or key_lower.startswith('t_'):
+                                            time_series_from_arrays[cycle_num]['time'] = arr_clean
+                                        elif 'voltage' in key_lower or key_lower.startswith('v_') or key_lower.endswith('_v'):
+                                            time_series_from_arrays[cycle_num]['voltage'] = arr_clean
+                                        elif 'current' in key_lower or key_lower.startswith('i_') or key_lower.endswith('_i'):
+                                            time_series_from_arrays[cycle_num]['current'] = arr_clean
+                                except:
+                                    pass
+                            
+                            # Store time-series in session state for later use
+                            if time_series_from_arrays:
+                                st.session_state.mat_time_series = time_series_from_arrays
 
                 if df is not None:
                     # Show detected columns / arrays to the user for transparency
                     try:
                         st.markdown("### Detected Columns / Arrays")
                         cols = list(df.columns)
-                        # Show basic table of column names and dtypes
-                        col_types = [(c, str(df[c].dtype)) for c in cols]
-                        st.write(pd.DataFrame(col_types, columns=["column", "dtype"]))
+                        
+                        # For .mat files, show comprehensive information about all arrays
+                        if name.endswith(".mat") and 'mat_available_keys' in st.session_state:
+                            available_keys = st.session_state.mat_available_keys
+                            all_arrays = st.session_state.mat_all_arrays
+                            
+                            st.markdown(f"**Total columns in DataFrame:** {len(cols)}")
+                            st.markdown(f"**Total arrays found in .mat file:** {len(available_keys)}")
+                            
+                            # Show all columns in DataFrame
+                            st.markdown("#### All Columns in DataFrame")
+                            col_types = [(c, str(df[c].dtype), len(df[c]), 
+                                         f"{df[c].min():.4f}" if np.issubdtype(df[c].dtype, np.number) else "N/A",
+                                         f"{df[c].max():.4f}" if np.issubdtype(df[c].dtype, np.number) else "N/A") 
+                                        for c in cols]
+                            cols_df = pd.DataFrame(col_types, columns=["Column", "Data Type", "Length", "Min", "Max"])
+                            st.dataframe(cols_df, use_container_width=True, hide_index=True)
+                            
+                            # Show all arrays found in .mat file (even if not in DataFrame)
+                            if available_keys:
+                                st.markdown("#### All Arrays Found in .mat File")
+                                all_arrays_info = []
+                                for key in available_keys[:100]:  # Limit to first 100 to avoid overwhelming display
+                                    try:
+                                        if key in all_arrays:
+                                            arr = all_arrays[key]
+                                            arr_clean = np.squeeze(arr)
+                                            dtype = arr_clean.dtype if isinstance(arr_clean, np.ndarray) else type(arr_clean).__name__
+                                            shape = arr_clean.shape if isinstance(arr_clean, np.ndarray) else "N/A"
+                                            in_df = "Yes" if key in cols or key.split('.')[-1].replace(' ', '_').replace('-', '_') in cols else "No"
+                                            all_arrays_info.append({
+                                                "Array Name": key,
+                                                "In DataFrame": in_df,
+                                                "Shape": str(shape),
+                                                "Data Type": str(dtype)
+                                            })
+                                    except:
+                                        pass
+                                
+                                if all_arrays_info:
+                                    arrays_df = pd.DataFrame(all_arrays_info)
+                                    st.dataframe(arrays_df, use_container_width=True, hide_index=True)
+                                    if len(available_keys) > 100:
+                                        st.info(f"Showing first 100 arrays. Total arrays found: {len(available_keys)}")
+                        else:
+                            # For CSV files or if available_keys not defined, show simple table
+                            col_types = [(c, str(df[c].dtype)) for c in cols]
+                            st.write(pd.DataFrame(col_types, columns=["column", "dtype"]))
 
                         # Map likely roles for cycle-level datasets
                         cols_l = [c.lower() for c in cols]
@@ -1515,8 +1887,15 @@ with tab2:
                                 st.write(f"- {k}: {v}")
                         else:
                             st.info("No standard cycle-level roles inferred from column names. The app will attempt heuristic detection.")
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        # Fallback to simple display if detailed display fails
+                        try:
+                            st.markdown("### Detected Columns / Arrays")
+                            cols = list(df.columns)
+                            col_types = [(c, str(df[c].dtype)) for c in cols]
+                            st.write(pd.DataFrame(col_types, columns=["column", "dtype"]))
+                        except:
+                            pass
                     # Check if this is cycle-level data
                     is_cycle_level = _detect_cycle_level_data(df)
                     
@@ -1525,6 +1904,18 @@ with tab2:
                         cycle_data = _parse_cycle_level_data(df)
                         time_series = _parse_time_series_columns(df)
                         
+                        # Merge with time-series data extracted from .mat arrays if available
+                        if name.endswith(".mat") and 'mat_time_series' in st.session_state:
+                            mat_ts = st.session_state.mat_time_series
+                            # Merge into time_series dict
+                            for cycle_num, ts_data in mat_ts.items():
+                                if cycle_num not in time_series:
+                                    time_series[cycle_num] = {}
+                                # Update with mat time-series data (don't overwrite existing)
+                                for key, value in ts_data.items():
+                                    if key not in time_series[cycle_num]:
+                                        time_series[cycle_num][key] = value
+                        
                         if cycle_data is None or len(cycle_data) == 0:
                             st.error("Could not parse cycle-level data. Please check column names.")
                             st.stop()
@@ -1532,235 +1923,372 @@ with tab2:
                         # Extract cycle features
                         cycle_features = _extract_cycle_features(cycle_data)
                         degradation_interps = _generate_degradation_interpretations(cycle_features, cycle_data)
+                        quality_notes, richness_notes = _assess_data_quality_and_richness(cycle_data, time_series, cycle_features)
                         
-                        # Display cycle-level analysis
-                        st.markdown("### Cycle-Life Analysis")
-                        st.write(f"**Number of cycles:** {cycle_features.get('n_cycles', 'N/A')}")
-                        if 'capacity_initial_Ah' in cycle_features and np.isfinite(cycle_features['capacity_initial_Ah']):
-                            st.write(f"**Initial capacity:** {cycle_features['capacity_initial_Ah']:.3f} Ah")
-                        if 'capacity_final_Ah' in cycle_features and np.isfinite(cycle_features['capacity_final_Ah']):
-                            st.write(f"**Final capacity:** {cycle_features['capacity_final_Ah']:.3f} Ah")
-                        if 'total_fade_percent' in cycle_features and np.isfinite(cycle_features['total_fade_percent']):
-                            st.write(f"**Total fade:** {cycle_features['total_fade_percent']:.2f}%")
-                        if 'fade_rate_percent_per_cycle' in cycle_features and np.isfinite(cycle_features['fade_rate_percent_per_cycle']):
-                            st.write(f"**Fade rate:** {cycle_features['fade_rate_percent_per_cycle']:.4f}% per cycle")
+                        # ============================================================
+                        # DATA QUALITY & RICHNESS ASSESSMENT
+                        # ============================================================
+                        st.markdown("### Data Quality & Richness Assessment")
+                        
+                        col_qual1, col_qual2 = st.columns(2, gap="medium")
+                        
+                        with col_qual1:
+                            st.markdown("#### Data Quality")
+                            for note in quality_notes:
+                                st.write("- " + note)
+                        
+                        with col_qual2:
+                            st.markdown("#### Dataset Richness")
+                            for note in richness_notes:
+                                st.write("- " + note)
                         
                         st.divider()
-                        do_plots = st.button("Visualize cycle-life plots", type="primary")
                         
-                        if do_plots:
-                            st.markdown("### Cycle-Life Visualizations (4 Plots)")
-                            
-                            # Create 2x2 grid layout
-                            col1, col2 = st.columns(2, gap="medium")
-                            
-                            # Plot 1: Capacity vs cycle
-                            with col1:
-                                if 'discharge_capacity' in cycle_data.columns:
-                                    cap_data = cycle_data.dropna(subset=['cycle', 'discharge_capacity'])
-                                    if len(cap_data) > 0:
-                                        cap_chart = alt.Chart(cap_data).mark_line(point=True, pointSize=6).encode(
-                                            x=alt.X("cycle:Q", title="Cycle Number"),
-                                            y=alt.Y("discharge_capacity:Q", title="Discharge Capacity (Ah)"),
-                                            tooltip=['cycle:Q', 'discharge_capacity:Q']
-                                        ).properties(title="1. Discharge Capacity vs Cycle Life", width=450, height=300)
-                                        st.altair_chart(cap_chart, width='stretch')
-                                    else:
-                                        st.info("No capacity data available")
+                        # ============================================================
+                        # KEY FEATURES (Max, Min, Number of Cycles)
+                        # ============================================================
+                        st.markdown("### Key Features")
+                        
+                        # Create feature summary table
+                        features_data = []
+                        
+                        # Capacity features
+                        if 'discharge_capacity' in cycle_data.columns:
+                            cap_valid = cycle_data['discharge_capacity'].dropna()
+                            if len(cap_valid) > 0:
+                                features_data.append({
+                                    "Parameter": "Discharge Capacity",
+                                    "Max": f"{cycle_features.get('capacity_max_Ah', np.nan):.4f} Ah" if 'capacity_max_Ah' in cycle_features else "N/A",
+                                    "Min": f"{cycle_features.get('capacity_min_Ah', np.nan):.4f} Ah" if 'capacity_min_Ah' in cycle_features else "N/A",
+                                    "Mean": f"{cycle_features.get('capacity_mean_Ah', np.nan):.4f} Ah" if 'capacity_mean_Ah' in cycle_features else "N/A",
+                                    "No. of Cycles": f"{len(cap_valid)}",
+                                    "Initial": f"{cycle_features.get('capacity_initial_Ah', np.nan):.4f} Ah" if 'capacity_initial_Ah' in cycle_features else "N/A",
+                                    "Final": f"{cycle_features.get('capacity_final_Ah', np.nan):.4f} Ah" if 'capacity_final_Ah' in cycle_features else "N/A"
+                                })
+                        
+                        # Internal Resistance features
+                        if 'internal_resistance' in cycle_data.columns:
+                            ir_valid = cycle_data['internal_resistance'].dropna()
+                            if len(ir_valid) > 0:
+                                features_data.append({
+                                    "Parameter": "Internal Resistance",
+                                    "Max": f"{cycle_features.get('ir_max_Ohm', np.nan):.4f} Ω" if 'ir_max_Ohm' in cycle_features else "N/A",
+                                    "Min": f"{cycle_features.get('ir_min_Ohm', np.nan):.4f} Ω" if 'ir_min_Ohm' in cycle_features else "N/A",
+                                    "Mean": f"{cycle_features.get('ir_mean_Ohm', np.nan):.4f} Ω" if 'ir_mean_Ohm' in cycle_features else "N/A",
+                                    "No. of Cycles": f"{len(ir_valid)}",
+                                    "Initial": f"{cycle_features.get('ir_initial_Ohm', np.nan):.4f} Ω" if 'ir_initial_Ohm' in cycle_features else "N/A",
+                                    "Final": f"{cycle_features.get('ir_final_Ohm', np.nan):.4f} Ω" if 'ir_final_Ohm' in cycle_features else "N/A"
+                                })
+                        
+                        # Temperature features
+                        if 'temperature' in cycle_data.columns:
+                            temp_valid = cycle_data['temperature'].dropna()
+                            if len(temp_valid) > 0:
+                                features_data.append({
+                                    "Parameter": "Temperature",
+                                    "Max": f"{cycle_features.get('temp_max_C', np.nan):.2f} °C" if 'temp_max_C' in cycle_features else "N/A",
+                                    "Min": f"{cycle_features.get('temp_min_C', np.nan):.2f} °C" if 'temp_min_C' in cycle_features else "N/A",
+                                    "Mean": f"{cycle_features.get('temp_mean_C', np.nan):.2f} °C" if 'temp_mean_C' in cycle_features else "N/A",
+                                    "No. of Cycles": f"{len(temp_valid)}",
+                                    "Initial": "N/A",
+                                    "Final": "N/A"
+                                })
+                        
+                        # Overall cycle info
+                        if cycle_features.get('n_cycles', 0) > 0:
+                            features_data.append({
+                                "Parameter": "Cycle Life",
+                                "Max": f"{cycle_features.get('cycle_range', [0, 0])[1]}" if 'cycle_range' in cycle_features else "N/A",
+                                "Min": f"{cycle_features.get('cycle_range', [0, 0])[0]}" if 'cycle_range' in cycle_features else "N/A",
+                                "Mean": "N/A",
+                                "No. of Cycles": f"{cycle_features.get('n_cycles', 0)}",
+                                "Initial": "N/A",
+                                "Final": "N/A"
+                            })
+                        
+                        if features_data:
+                            features_df = pd.DataFrame(features_data)
+                            st.dataframe(features_df, use_container_width=True, hide_index=True)
+                        
+                        # Additional summary metrics
+                        st.markdown("#### Summary Statistics")
+                        col_sum1, col_sum2, col_sum3 = st.columns(3, gap="medium")
+                        
+                        with col_sum1:
+                            if 'total_fade_percent' in cycle_features and np.isfinite(cycle_features['total_fade_percent']):
+                                st.metric("Total Capacity Fade", f"{cycle_features['total_fade_percent']:.2f}%")
+                            if 'fade_rate_percent_per_cycle' in cycle_features and np.isfinite(cycle_features['fade_rate_percent_per_cycle']):
+                                st.metric("Fade Rate", f"{cycle_features['fade_rate_percent_per_cycle']:.4f}% per cycle")
+                        
+                        with col_sum2:
+                            if 'ir_growth_percent' in cycle_features and np.isfinite(cycle_features['ir_growth_percent']):
+                                st.metric("IR Growth", f"{cycle_features['ir_growth_percent']:.2f}%")
+                        
+                        with col_sum3:
+                            st.metric("Total Cycles", f"{cycle_features.get('n_cycles', 0)}")
+                        
+                        st.divider()
+                        
+                        # ============================================================
+                        # 4 REQUIRED PLOTS (Automatically Displayed)
+                        # ============================================================
+                        st.markdown("### Cycle-Life Visualizations")
+                        
+                        # Create 2x2 grid layout for the 4 plots
+                        col1, col2 = st.columns(2, gap="medium")
+                        
+                        # Plot 1: Discharge Capacity vs Cycle Life
+                        with col1:
+                            if 'discharge_capacity' in cycle_data.columns:
+                                cap_data = cycle_data.dropna(subset=['cycle', 'discharge_capacity'])
+                                if len(cap_data) > 0:
+                                    cap_chart = alt.Chart(cap_data).mark_line(point={'size': 100}).encode(
+                                        x=alt.X("cycle:Q", title="Cycle Number"),
+                                        y=alt.Y("discharge_capacity:Q", title="Discharge Capacity (Ah)"),
+                                        tooltip=['cycle:Q', 'discharge_capacity:Q']
+                                    ).properties(title="1. Discharge Capacity vs Cycle Life", width=450, height=300)
+                                    st.altair_chart(cap_chart, width='stretch')
                                 else:
-                                    st.info("Discharge capacity column not found")
-                            
-                            # Plot 2: IR vs cycle
-                            with col2:
-                                if 'internal_resistance' in cycle_data.columns and cycle_data['internal_resistance'].notna().any():
-                                    ir_data = cycle_data.dropna(subset=['cycle', 'internal_resistance'])
-                                    if len(ir_data) > 0:
-                                        ir_chart = alt.Chart(ir_data).mark_line(point=True, pointSize=6, color='#FF6B6B').encode(
-                                            x=alt.X("cycle:Q", title="Cycle Number"),
-                                            y=alt.Y("internal_resistance:Q", title="Internal Resistance (Ohm)"),
-                                            tooltip=['cycle:Q', 'internal_resistance:Q']
-                                        ).properties(title="2. Internal Resistance vs Cycle Life", width=450, height=300)
-                                        st.altair_chart(ir_chart, width='stretch')
-                                    else:
-                                        st.info("No IR data available")
+                                    st.info("No capacity data available")
+                            else:
+                                st.info("Discharge capacity column not found")
+                        
+                        # Plot 2: Internal Resistance vs Cycle Life
+                        with col2:
+                            if 'internal_resistance' in cycle_data.columns and cycle_data['internal_resistance'].notna().any():
+                                ir_data = cycle_data.dropna(subset=['cycle', 'internal_resistance'])
+                                if len(ir_data) > 0:
+                                    ir_chart = alt.Chart(ir_data).mark_line(point={'size': 100}, color='#FF6B6B').encode(
+                                        x=alt.X("cycle:Q", title="Cycle Number"),
+                                        y=alt.Y("internal_resistance:Q", title="Internal Resistance (Ohm)"),
+                                        tooltip=['cycle:Q', 'internal_resistance:Q']
+                                    ).properties(title="2. Internal Resistance vs Cycle Life", width=450, height=300)
+                                    st.altair_chart(ir_chart, width='stretch')
                                 else:
-                                    st.info("Internal resistance column not found")
-                            
-                            # Plot 3: Temperature vs cycle
-                            col3, col4 = st.columns(2, gap="medium")
-                            with col3:
-                                if 'temperature' in cycle_data.columns and cycle_data['temperature'].notna().any():
-                                    temp_data = cycle_data.dropna(subset=['cycle', 'temperature'])
-                                    if len(temp_data) > 0:
-                                        temp_chart = alt.Chart(temp_data).mark_line(point=True, pointSize=6, color='#FFA500').encode(
-                                            x=alt.X("cycle:Q", title="Cycle Number"),
-                                            y=alt.Y("temperature:Q", title="Temperature (°C)"),
-                                            tooltip=['cycle:Q', 'temperature:Q']
-                                        ).properties(title="3. Temperature vs Cycle Life", width=450, height=300)
-                                        st.altair_chart(temp_chart, width='stretch')
-                                    else:
-                                        st.info("No temperature data available")
+                                    st.info("No IR data available")
+                            else:
+                                st.info("Internal resistance column not found")
+                        
+                        # Plot 3: Temperature vs Cycle Life
+                        col3, col4 = st.columns(2, gap="medium")
+                        with col3:
+                            if 'temperature' in cycle_data.columns and cycle_data['temperature'].notna().any():
+                                temp_data = cycle_data.dropna(subset=['cycle', 'temperature'])
+                                if len(temp_data) > 0:
+                                    temp_chart = alt.Chart(temp_data).mark_line(point={'size': 100}, color='#FFA500').encode(
+                                        x=alt.X("cycle:Q", title="Cycle Number"),
+                                        y=alt.Y("temperature:Q", title="Temperature (°C)"),
+                                        tooltip=['cycle:Q', 'temperature:Q']
+                                    ).properties(title="3. Temperature vs Cycle Life", width=450, height=300)
+                                    st.altair_chart(temp_chart, width='stretch')
                                 else:
-                                    st.info("Temperature column not found")
+                                    st.info("No temperature data available")
+                            else:
+                                st.info("Temperature column not found")
                             
-                            # Plot 4: Current & Voltage Time-Series
-                            with col4:
-                                if time_series:
-                                    cycle_nums = sorted(time_series.keys())
-                                    if len(cycle_nums) > 0:
-                                        # Select cycles for time-series display
-                                        if len(cycle_nums) >= 3:
-                                            selected_cycles = [cycle_nums[0], cycle_nums[len(cycle_nums)//2], cycle_nums[-1]]
-                                            selected_label = f"First, Middle, Last cycles: {', '.join(map(str, selected_cycles))}"
-                                        elif len(cycle_nums) >= 1:
-                                            selected_cycles = cycle_nums[:min(3, len(cycle_nums))]
-                                            selected_label = f"Cycles: {', '.join(map(str, selected_cycles))}"
-                                        else:
-                                            selected_cycles = []
-                                            selected_label = "No cycles available"
-                                        
-                                        ts_charts = []
-                                        for cycle_num in selected_cycles:
-                                            if cycle_num in time_series:
-                                                ts = time_series[cycle_num]
-                                                time = ts.get('time', None)
-                                                current = ts.get('current', None)
-                                                voltage = ts.get('voltage', None)
-                                                
-                                                # Combine current and voltage data
-                                                if time is not None and (current is not None or voltage is not None):
-                                                    ts_data = []
-                                                    if current is not None:
-                                                        valid = np.isfinite(time) & np.isfinite(current)
-                                                        if np.any(valid):
-                                                            ts_data.append(pd.DataFrame({
-                                                                'time': time[valid],
-                                                                'value': current[valid],
-                                                                'metric': 'Current (A)',
-                                                                'cycle': cycle_num
-                                                            }))
-                                                    if voltage is not None:
-                                                        valid = np.isfinite(time) & np.isfinite(voltage)
-                                                        if np.any(valid):
-                                                            ts_data.append(pd.DataFrame({
-                                                                'time': time[valid],
-                                                                'value': voltage[valid],
-                                                                'metric': 'Voltage (V)',
-                                                                'cycle': cycle_num
-                                                            }))
-                                                    if ts_data:
-                                                        ts_charts.append(pd.concat(ts_data, ignore_index=True))
-                                        
-                                        if ts_charts:
-                                            combined_ts = pd.concat(ts_charts, ignore_index=True)
-                                            ts_chart = alt.Chart(combined_ts).mark_line().encode(
-                                                x=alt.X("time:Q", title="Time (s)"),
-                                                y=alt.Y("value:Q", title="Value"),
-                                                color=alt.Color("metric:N", title="Metric"),
-                                                detail='cycle:N',
-                                                tooltip=['time:Q', 'value:Q', 'metric:N', 'cycle:N']
-                                            ).properties(title=f"4. Current & Voltage Profile\n({selected_label})", width=450, height=300)
-                                            st.altair_chart(ts_chart, width='stretch')
-                                        else:
-                                            st.info("No valid time-series data found")
-                                    else:
-                                        st.info("No time-series data available")
-                                else:
-                                    st.info("Time-series data not provided in dataset")
-                            
-                            # Time-series plots
+                        # Plot 4: Current & Voltage Time-Series Profile
+                        with col4:
                             if time_series:
-                                st.markdown("### Time-Series Plots (First/Middle/Last Cycles)")
                                 cycle_nums = sorted(time_series.keys())
-                                if len(cycle_nums) >= 3:
-                                    selected = [cycle_nums[0], cycle_nums[len(cycle_nums)//2], cycle_nums[-1]]
-                                elif len(cycle_nums) >= 1:
-                                    selected = cycle_nums[:min(3, len(cycle_nums))]
+                                if len(cycle_nums) > 0:
+                                    # Select cycles for time-series display
+                                    if len(cycle_nums) >= 3:
+                                        selected_cycles = [cycle_nums[0], cycle_nums[len(cycle_nums)//2], cycle_nums[-1]]
+                                        selected_label = f"First, Middle, Last cycles: {', '.join(map(str, selected_cycles))}"
+                                    elif len(cycle_nums) >= 1:
+                                        selected_cycles = cycle_nums[:min(3, len(cycle_nums))]
+                                        selected_label = f"Cycles: {', '.join(map(str, selected_cycles))}"
+                                    else:
+                                        selected_cycles = []
+                                        selected_label = "No cycles available"
+                                    
+                                    ts_charts = []
+                                    for cycle_num in selected_cycles:
+                                        if cycle_num in time_series:
+                                            ts = time_series[cycle_num]
+                                            time = ts.get('time', None)
+                                            current = ts.get('current', None)
+                                            voltage = ts.get('voltage', None)
+                                            
+                                            # Combine current and voltage data
+                                            if time is not None and (current is not None or voltage is not None):
+                                                ts_data = []
+                                                # Ensure time is a numpy array
+                                                if isinstance(time, (list, tuple)):
+                                                    time = np.array(time)
+                                                
+                                                if current is not None:
+                                                    # Ensure current is a numpy array and same length as time
+                                                    if isinstance(current, (list, tuple)):
+                                                        current = np.array(current)
+                                                    # Match lengths
+                                                    min_len = min(len(time), len(current))
+                                                    time_aligned = time[:min_len]
+                                                    current_aligned = current[:min_len]
+                                                    valid = np.isfinite(time_aligned) & np.isfinite(current_aligned)
+                                                    if np.any(valid):
+                                                        ts_data.append(pd.DataFrame({
+                                                            'time': time_aligned[valid],
+                                                            'value': current_aligned[valid],
+                                                            'metric': 'Current (A)',
+                                                            'cycle': cycle_num
+                                                        }))
+                                                if voltage is not None:
+                                                    # Ensure voltage is a numpy array and same length as time
+                                                    if isinstance(voltage, (list, tuple)):
+                                                        voltage = np.array(voltage)
+                                                    # Match lengths
+                                                    min_len = min(len(time), len(voltage))
+                                                    time_aligned = time[:min_len]
+                                                    voltage_aligned = voltage[:min_len]
+                                                    valid = np.isfinite(time_aligned) & np.isfinite(voltage_aligned)
+                                                    if np.any(valid):
+                                                        ts_data.append(pd.DataFrame({
+                                                            'time': time_aligned[valid],
+                                                            'value': voltage_aligned[valid],
+                                                            'metric': 'Voltage (V)',
+                                                            'cycle': cycle_num
+                                                        }))
+                                                if ts_data:
+                                                    ts_charts.append(pd.concat(ts_data, ignore_index=True))
+                                    
+                                    if ts_charts:
+                                        combined_ts = pd.concat(ts_charts, ignore_index=True)
+                                        ts_chart = alt.Chart(combined_ts).mark_line().encode(
+                                            x=alt.X("time:Q", title="Time (s)"),
+                                            y=alt.Y("value:Q", title="Value"),
+                                            color=alt.Color("metric:N", title="Metric"),
+                                            detail='cycle:N',
+                                            tooltip=['time:Q', 'value:Q', 'metric:N', 'cycle:N']
+                                        ).properties(title=f"4. Current & Voltage Profile\n({selected_label})", width=450, height=300)
+                                        st.altair_chart(ts_chart, width='stretch')
+                                    else:
+                                        st.info("No valid time-series data found")
                                 else:
-                                    selected = []
-                                
-                                for cycle_num in selected:
-                                    if cycle_num in time_series:
-                                        ts = time_series[cycle_num]
-                                        time = ts.get('time', None)
-                                        current = ts.get('current', None)
-                                        voltage = ts.get('voltage', None)
+                                    st.info("No time-series data available")
+                            else:
+                                st.info("Time-series data not provided in dataset")
+                        
+                        # Additional detailed time-series plots (if available)
+                        if time_series:
+                            st.markdown("### Detailed Time-Series Plots (First/Middle/Last Cycles)")
+                            cycle_nums = sorted(time_series.keys())
+                            if len(cycle_nums) >= 3:
+                                selected = [cycle_nums[0], cycle_nums[len(cycle_nums)//2], cycle_nums[-1]]
+                            elif len(cycle_nums) >= 1:
+                                selected = cycle_nums[:min(3, len(cycle_nums))]
+                            else:
+                                selected = []
+                            
+                            for cycle_num in selected:
+                                if cycle_num in time_series:
+                                    ts = time_series[cycle_num]
+                                    time = ts.get('time', None)
+                                    current = ts.get('current', None)
+                                    voltage = ts.get('voltage', None)
+                                    
+                                    if time is not None and (current is not None or voltage is not None):
+                                        st.markdown(f"**Cycle {cycle_num}**")
+                                        cols_ts = st.columns(2)
                                         
-                                        if time is not None and (current is not None or voltage is not None):
-                                            st.markdown(f"**Cycle {cycle_num}**")
-                                            cols_ts = st.columns(2)
-                                            if current is not None:
-                                                ts_df = pd.DataFrame({'time': time, 'current': current})
-                                                ts_df = ts_df.dropna()
-                                                if len(ts_df) > 0:
-                                                    with cols_ts[0]:
-                                                        curr_chart = alt.Chart(ts_df).mark_line().encode(
-                                                            x=alt.X("time:Q", title="Time (s)"),
-                                                            y=alt.Y("current:Q", title="Current (A)")
-                                                        ).properties(title=f"Cycle {cycle_num} - Current", width=300, height=200)
-                                                        st.altair_chart(curr_chart, width='stretch')
-                                            if voltage is not None:
-                                                ts_df = pd.DataFrame({'time': time, 'voltage': voltage})
-                                                ts_df = ts_df.dropna()
-                                                if len(ts_df) > 0:
-                                                    with cols_ts[1]:
-                                                        volt_chart = alt.Chart(ts_df).mark_line().encode(
-                                                            x=alt.X("time:Q", title="Time (s)"),
-                                                            y=alt.Y("voltage:Q", title="Voltage (V)")
-                                                        ).properties(title=f"Cycle {cycle_num} - Voltage", width=300, height=200)
-                                                        st.altair_chart(volt_chart, width='stretch')
+                                        # Ensure time is a numpy array
+                                        if isinstance(time, (list, tuple)):
+                                            time = np.array(time)
+                                        
+                                        if current is not None:
+                                            # Ensure current is a numpy array and match length with time
+                                            if isinstance(current, (list, tuple)):
+                                                current = np.array(current)
+                                            min_len = min(len(time), len(current))
+                                            time_aligned = time[:min_len]
+                                            current_aligned = current[:min_len]
+                                            ts_df = pd.DataFrame({'time': time_aligned, 'current': current_aligned})
+                                            ts_df = ts_df.dropna()
+                                            if len(ts_df) > 0:
+                                                with cols_ts[0]:
+                                                    curr_chart = alt.Chart(ts_df).mark_line().encode(
+                                                        x=alt.X("time:Q", title="Time (s)"),
+                                                        y=alt.Y("current:Q", title="Current (A)")
+                                                    ).properties(title=f"Cycle {cycle_num} - Current", width=300, height=200)
+                                                    st.altair_chart(curr_chart, width='stretch')
+                                        if voltage is not None:
+                                            # Ensure voltage is a numpy array and match length with time
+                                            if isinstance(voltage, (list, tuple)):
+                                                voltage = np.array(voltage)
+                                            min_len = min(len(time), len(voltage))
+                                            time_aligned = time[:min_len]
+                                            voltage_aligned = voltage[:min_len]
+                                            ts_df = pd.DataFrame({'time': time_aligned, 'voltage': voltage_aligned})
+                                            ts_df = ts_df.dropna()
+                                            if len(ts_df) > 0:
+                                                with cols_ts[1]:
+                                                    volt_chart = alt.Chart(ts_df).mark_line().encode(
+                                                        x=alt.X("time:Q", title="Time (s)"),
+                                                        y=alt.Y("voltage:Q", title="Voltage (V)")
+                                                    ).properties(title=f"Cycle {cycle_num} - Voltage", width=300, height=200)
+                                                    st.altair_chart(volt_chart, width='stretch')
+                        
+                        st.divider()
+                        
+                        # ============================================================
+                        # DEGRADATION TREND ANALYSIS
+                        # ============================================================
+                        st.markdown("### Degradation Trend Analysis")
+                        for di in degradation_interps:
+                            st.write("- " + di)
+                        
+                        st.divider()
+                        
+                        # ============================================================
+                        # EXPORT OPTIONS
+                        # ============================================================
+                        st.markdown("### Export Options")
+                        
+                        # Export .mat file
+                        if SCIPY_OK:
+                            mat_buf = io.BytesIO()
+                            mat_data = {
+                                'cycle': cycle_data['cycle'].values.astype(float),
+                                'discharge_capacity': cycle_data['discharge_capacity'].values.astype(float),
+                            }
+                            if 'internal_resistance' in cycle_data.columns:
+                                mat_data['internal_resistance'] = cycle_data['internal_resistance'].values.astype(float)
+                            if 'temperature' in cycle_data.columns:
+                                mat_data['temperature'] = cycle_data['temperature'].values.astype(float)
                             
-                            st.markdown("### Degradation Trend Analysis")
-                            for di in degradation_interps:
-                                st.write("- " + di)
+                            # Add time-series data if available
+                            if time_series:
+                                for cycle_num, ts in time_series.items():
+                                    if 'time' in ts:
+                                        mat_data[f'time_{cycle_num}'] = ts['time'].astype(float)
+                                    if 'current' in ts:
+                                        mat_data[f'current_{cycle_num}'] = ts['current'].astype(float)
+                                    if 'voltage' in ts:
+                                        mat_data[f'voltage_{cycle_num}'] = ts['voltage'].astype(float)
                             
-                            # Export .mat file
-                            if SCIPY_OK:
-                                mat_buf = io.BytesIO()
-                                mat_data = {
-                                    'cycle': cycle_data['cycle'].values.astype(float),
-                                    'discharge_capacity': cycle_data['discharge_capacity'].values.astype(float),
-                                }
-                                if 'internal_resistance' in cycle_data.columns:
-                                    mat_data['internal_resistance'] = cycle_data['internal_resistance'].values.astype(float)
-                                if 'temperature' in cycle_data.columns:
-                                    mat_data['temperature'] = cycle_data['temperature'].values.astype(float)
-                                
-                                # Add time-series data if available
-                                if time_series:
-                                    for cycle_num, ts in time_series.items():
-                                        if 'time' in ts:
-                                            mat_data[f'time_{cycle_num}'] = ts['time'].astype(float)
-                                        if 'current' in ts:
-                                            mat_data[f'current_{cycle_num}'] = ts['current'].astype(float)
-                                        if 'voltage' in ts:
-                                            mat_data[f'voltage_{cycle_num}'] = ts['voltage'].astype(float)
-                                
-                                savemat(mat_buf, mat_data)
-                                mat_buf.seek(0)
-                                
-                                st.download_button(
-                                    "Download processed data (.mat)",
-                                    data=mat_buf.getvalue(),
-                                    file_name="BatteryLab_cycle_data.mat",
-                                    mime="application/octet-stream"
-                                )
+                            savemat(mat_buf, mat_data)
+                            mat_buf.seek(0)
                             
-                            # PDF Download
-                            pdf_bytes = generate_pdf_report(
-                                cycle_data=cycle_data,
-                                cycle_features=cycle_features,
-                                degradation_interps=degradation_interps,
-                                time_series=time_series
-                            )
                             st.download_button(
-                                "Download Full Report (PDF)",
-                                data=pdf_bytes,
-                                file_name="BatteryLab_cycle_analysis_report.pdf",
-                                mime="application/pdf"
+                                "Download processed data (.mat)",
+                                data=mat_buf.getvalue(),
+                                file_name="BatteryLab_cycle_data.mat",
+                                mime="application/octet-stream"
                             )
-                        else:
-                            st.info("Click **Visualize cycle-life plots** to see charts and download the PDF report.")
+                        
+                        # PDF Download
+                        pdf_bytes = generate_pdf_report(
+                            cycle_data=cycle_data,
+                            cycle_features=cycle_features,
+                            degradation_interps=degradation_interps,
+                            time_series=time_series
+                        )
+                        st.download_button(
+                            "Download Full Report (PDF)",
+                            data=pdf_bytes,
+                            file_name="BatteryLab_cycle_analysis_report.pdf",
+                            mime="application/pdf"
+                        )
                     else:
                         # Original voltage-capacity processing
                         vcol, qcol, cyc = _standardize_columns(df)

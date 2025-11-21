@@ -1410,8 +1410,331 @@ with tab2:
                         st.session_state.mat_available_keys = available_keys
 
                         # Try to reconstruct DataFrame from .mat
-                        # Look for cycle-level data first
-                        cycle_data_mat = None
+                        # First, check for cell11dataset_for_python structure
+                        df = None
+                        cycles_data = None
+                        
+                        # Check if this is a cell11dataset_for_python structure
+                        # Top-level variables: policy, policy_readable, cycle_life, cycles, summary, Vdlin
+                        has_summary = 'summary' in mat or 'summary' in all_arrays
+                        has_cycles = 'cycles' in mat or 'cycles' in all_arrays
+                        
+                        if has_summary and has_cycles:
+                            try:
+                                # Extract summary struct - check multiple possible locations
+                                summary_data = None
+                                # Try direct access first
+                                if 'summary' in mat:
+                                    summary_data = mat['summary']
+                                elif 'Summary' in mat:
+                                    summary_data = mat['Summary']
+                                
+                                # If not found, try from all_arrays
+                                if summary_data is None:
+                                    # First try direct keys
+                                    for key in ['summary', 'Summary']:
+                                        if key in all_arrays:
+                                            summary_data = all_arrays[key]
+                                            break
+                                    
+                                    # If still not found, try to reconstruct from extracted fields (summary.*)
+                                    if summary_data is None:
+                                        summary_data = {}
+                                        summary_field_names = ['cycle', 'QDischarge', 'QCharge', 'IR', 'Tmax', 'Tavg', 'Tmin', 'chargetime']
+                                        found_fields = False
+                                        
+                                        # Look for summary.fieldname or Summary.fieldname patterns
+                                        for arr_key in all_arrays.keys():
+                                            # Check for summary.fieldname pattern
+                                            if arr_key.startswith('summary.') or arr_key.startswith('Summary.'):
+                                                field_name = arr_key.split('.', 1)[1]
+                                                # Also check simplified name (without summary prefix)
+                                                if field_name in summary_field_names:
+                                                    summary_data[field_name] = all_arrays[arr_key]
+                                                    found_fields = True
+                                            # Also check for direct field names (might have been extracted without prefix)
+                                            elif arr_key in summary_field_names:
+                                                summary_data[arr_key] = all_arrays[arr_key]
+                                                found_fields = True
+                                        
+                                        # If we found individual fields, use them; otherwise set to None
+                                        if not found_fields or len(summary_data) == 0:
+                                            summary_data = None
+                                        
+                                        # Additional fallback: try to find summary fields that might have been extracted differently
+                                        if summary_data is None or (isinstance(summary_data, dict) and len(summary_data) < 3):
+                                            # Look for any arrays that match summary field names (case-insensitive)
+                                            potential_summary = {}
+                                            expected_len_fallback = None
+                                            for arr_key, arr_value in all_arrays.items():
+                                                arr_key_lower = arr_key.lower()
+                                                # Check if key contains summary field names
+                                                if isinstance(arr_value, np.ndarray):
+                                                    arr_clean = np.squeeze(arr_value)
+                                                    if arr_clean.ndim == 1 and len(arr_clean) > 0:
+                                                        # Check for cycle first to set expected length
+                                                        if 'cycle' in arr_key_lower and 'cycle' not in potential_summary:
+                                                            if len(arr_clean) == 1077 or expected_len_fallback is None:  # Expected length or first field
+                                                                potential_summary['cycle'] = arr_clean
+                                                                expected_len_fallback = len(arr_clean)
+                                                        # Check for QDischarge
+                                                        elif ('qdischarge' in arr_key_lower or ('discharge' in arr_key_lower and 'q' in arr_key_lower)) and 'cycle' not in arr_key_lower:
+                                                            if 'QDischarge' not in potential_summary and (expected_len_fallback is None or len(arr_clean) == expected_len_fallback):
+                                                                potential_summary['QDischarge'] = arr_clean
+                                                                if expected_len_fallback is None:
+                                                                    expected_len_fallback = len(arr_clean)
+                                                        # Check for IR (make sure it's not part of another word like "circuit")
+                                                        elif (arr_key_lower == 'ir' or arr_key_lower.endswith('.ir') or arr_key_lower.endswith('_ir')) and expected_len_fallback is not None:
+                                                            if 'IR' not in potential_summary and len(arr_clean) == expected_len_fallback:
+                                                                potential_summary['IR'] = arr_clean
+                                                        # Check for Tmax
+                                                        elif ('tmax' in arr_key_lower or arr_key_lower.endswith('.tmax')) and expected_len_fallback is not None:
+                                                            if 'Tmax' not in potential_summary and len(arr_clean) == expected_len_fallback:
+                                                                potential_summary['Tmax'] = arr_clean
+                                                        # Check for Tavg
+                                                        elif ('tavg' in arr_key_lower or arr_key_lower.endswith('.tavg')) and expected_len_fallback is not None:
+                                                            if 'Tavg' not in potential_summary and len(arr_clean) == expected_len_fallback:
+                                                                potential_summary['Tavg'] = arr_clean
+                                                        # Check for Tmin
+                                                        elif ('tmin' in arr_key_lower or arr_key_lower.endswith('.tmin')) and expected_len_fallback is not None:
+                                                            if 'Tmin' not in potential_summary and len(arr_clean) == expected_len_fallback:
+                                                                potential_summary['Tmin'] = arr_clean
+                                            
+                                            # If we found enough fields, use them
+                                            if len(potential_summary) >= 2 and 'cycle' in potential_summary:
+                                                summary_data = potential_summary
+                                
+                                # Extract cycles array
+                                cycles_data_raw = None
+                                if 'cycles' in mat:
+                                    cycles_data_raw = mat['cycles']
+                                elif 'Cycles' in mat:
+                                    cycles_data_raw = mat['Cycles']
+                                if cycles_data_raw is None:
+                                    for key in ['cycles', 'Cycles']:
+                                        if key in all_arrays:
+                                            cycles_data_raw = all_arrays[key]
+                                            break
+                                
+                                # Process summary struct if found
+                                if summary_data is not None:
+                                    summary_df = None
+                                    
+                                    # Collect all fields with their data
+                                    field_data_dict = {}
+                                    expected_length = None
+                                    
+                                    # Handle different MATLAB struct formats
+                                    if isinstance(summary_data, dict) and not any(k.startswith('_') for k in summary_data.keys()):
+                                        # Dict format (struct_as_record=True) or reconstructed from all_arrays
+                                        # Check if it has the required fields
+                                        if 'cycle' in summary_data or 'QDischarge' in summary_data:
+                                            for field, value in summary_data.items():
+                                                if field.startswith('_'):
+                                                    continue
+                                                # Handle numpy arrays
+                                                if isinstance(value, np.ndarray):
+                                                    value = np.squeeze(value)
+                                                    if value.ndim > 1:
+                                                        value = value.flatten()
+                                                    # Only keep 1D arrays with valid length
+                                                    if value.ndim == 1 and len(value) > 0:
+                                                        # Set expected length from cycle field first
+                                                        if expected_length is None and field == 'cycle':
+                                                            expected_length = len(value)
+                                                        # Only add if length matches expected (or set expected if first)
+                                                        if expected_length is None or len(value) == expected_length:
+                                                            if expected_length is None:
+                                                                expected_length = len(value)
+                                                            field_data_dict[field] = value
+                                    elif isinstance(summary_data, np.ndarray):
+                                        if summary_data.dtype.names:
+                                            # Structured array format - could be 1x1 or Nx1
+                                            summary_fields = summary_data.dtype.names
+                                            if 'cycle' in summary_fields or 'QDischarge' in summary_fields:
+                                                # Handle 1x1 structured array (common MATLAB format)
+                                                if summary_data.size == 1:
+                                                    # Extract from single element
+                                                    for field in summary_fields:
+                                                        field_data = summary_data[field].flat[0]
+                                                        if isinstance(field_data, np.ndarray):
+                                                            field_data = np.squeeze(field_data)
+                                                            if field_data.ndim > 1:
+                                                                field_data = field_data.flatten()
+                                                            if field_data.ndim == 1 and len(field_data) > 0:
+                                                                if expected_length is None and field == 'cycle':
+                                                                    expected_length = len(field_data)
+                                                                if expected_length is None or len(field_data) == expected_length:
+                                                                    if expected_length is None:
+                                                                        expected_length = len(field_data)
+                                                                    field_data_dict[field] = field_data
+                                                else:
+                                                    # Multiple elements - extract first or combine
+                                                    for field in summary_fields:
+                                                        field_data = summary_data[field]
+                                                        if isinstance(field_data, np.ndarray):
+                                                            field_data = np.squeeze(field_data)
+                                                            if field_data.ndim > 1:
+                                                                field_data = field_data.flatten()
+                                                            if field_data.ndim == 1 and len(field_data) > 0:
+                                                                if expected_length is None and field == 'cycle':
+                                                                    expected_length = len(field_data)
+                                                                if expected_length is None or len(field_data) == expected_length:
+                                                                    if expected_length is None:
+                                                                        expected_length = len(field_data)
+                                                                    field_data_dict[field] = field_data
+                                    elif hasattr(summary_data, '_fieldnames'):
+                                        # MATLAB struct object format
+                                        for field in summary_data._fieldnames:
+                                            value = getattr(summary_data, field, None)
+                                            if value is not None and isinstance(value, np.ndarray):
+                                                value = np.squeeze(value)
+                                                if value.ndim > 1:
+                                                    value = value.flatten()
+                                                if value.ndim == 1 and len(value) > 0:
+                                                    if expected_length is None and field == 'cycle':
+                                                        expected_length = len(value)
+                                                    if expected_length is None or len(value) == expected_length:
+                                                        if expected_length is None:
+                                                            expected_length = len(value)
+                                                        field_data_dict[field] = value
+                                    
+                                    # Create DataFrame only if we have valid data with matching lengths
+                                    if field_data_dict and expected_length is not None:
+                                        # Verify all fields have the same length
+                                        valid_fields = {}
+                                        for field, data in field_data_dict.items():
+                                            if len(data) == expected_length:
+                                                valid_fields[field] = data
+                                        
+                                        if valid_fields and 'cycle' in valid_fields:
+                                            # Debug: check what fields we found
+                                            found_fields_list = list(valid_fields.keys())
+                                            
+                                            summary_df = pd.DataFrame(valid_fields)
+                                            
+                                            # Standardize column names
+                                            column_mapping = {
+                                                'QDischarge': 'discharge_capacity',
+                                                'QCharge': 'charge_capacity',
+                                                'IR': 'internal_resistance',
+                                                'Tmax': 'temperature_max',
+                                                'Tavg': 'temperature_avg',
+                                                'Tmin': 'temperature_min',
+                                                'chargetime': 'charge_time'
+                                            }
+                                            # Only rename columns that exist
+                                            existing_mapping = {k: v for k, v in column_mapping.items() if k in summary_df.columns}
+                                            summary_df = summary_df.rename(columns=existing_mapping)
+                                            
+                                            # Create a combined temperature column
+                                            # Priority: Tavg > Tmax > Tmin
+                                            if 'temperature_avg' in summary_df.columns:
+                                                summary_df['temperature'] = summary_df['temperature_avg'].copy()
+                                            elif 'temperature_max' in summary_df.columns:
+                                                summary_df['temperature'] = summary_df['temperature_max'].copy()
+                                            elif 'temperature_min' in summary_df.columns:
+                                                summary_df['temperature'] = summary_df['temperature_min'].copy()
+                                            
+                                            # Ensure internal_resistance column exists (might be NaN if IR field had NaN values)
+                                            if 'internal_resistance' not in summary_df.columns and 'IR' in found_fields_list:
+                                                # This shouldn't happen, but just in case
+                                                summary_df['internal_resistance'] = valid_fields['IR']
+                                            
+                                            # Ensure temperature column exists
+                                            if 'temperature' not in summary_df.columns:
+                                                # Create empty column if none of the temperature fields were found
+                                                summary_df['temperature'] = np.nan
+                                            
+                                            df = summary_df
+                                
+                                # Process cycles array for time-series data (V, I, T, t, Qdlin)
+                                if cycles_data_raw is not None:
+                                    cycles_list = []
+                                    
+                                    # Handle different formats
+                                    if isinstance(cycles_data_raw, np.ndarray):
+                                        if cycles_data_raw.dtype == object:
+                                            # Object array - each element is a struct
+                                            for cycle_idx, cycle_struct in enumerate(cycles_data_raw.flat):
+                                                if cycle_struct is not None:
+                                                    cycle_dict = {}
+                                                    
+                                                    # Extract fields from struct
+                                                    if isinstance(cycle_struct, np.ndarray) and cycle_struct.dtype.names:
+                                                        # Structured array
+                                                        for field in cycle_struct.dtype.names:
+                                                            field_data = cycle_struct[field]
+                                                            if isinstance(field_data, np.ndarray):
+                                                                field_data = np.squeeze(field_data)
+                                                                cycle_dict[field] = field_data
+                                                    elif isinstance(cycle_struct, dict):
+                                                        # Dict format
+                                                        for field, value in cycle_struct.items():
+                                                            if not field.startswith('_') and isinstance(value, np.ndarray):
+                                                                cycle_dict[field] = np.squeeze(value)
+                                                    elif hasattr(cycle_struct, '_fieldnames'):
+                                                        # MATLAB struct object
+                                                        for field in cycle_struct._fieldnames:
+                                                            value = getattr(cycle_struct, field, None)
+                                                            if value is not None and isinstance(value, np.ndarray):
+                                                                cycle_dict[field] = np.squeeze(value)
+                                                    
+                                                    # Create DataFrame for this cycle
+                                                    if cycle_dict:
+                                                        cycle_df = pd.DataFrame(cycle_dict)
+                                                        cycle_df['cycle_number'] = cycle_idx
+                                                        cycles_list.append(cycle_df)
+                                        elif cycles_data_raw.dtype.names:
+                                            # Single structured array with multiple records
+                                            for cycle_idx in range(len(cycles_data_raw)):
+                                                cycle_dict = {}
+                                                for field in cycles_data_raw.dtype.names:
+                                                    field_data = cycles_data_raw[field][cycle_idx]
+                                                    if isinstance(field_data, np.ndarray):
+                                                        cycle_dict[field] = np.squeeze(field_data)
+                                                if cycle_dict:
+                                                    cycle_df = pd.DataFrame(cycle_dict)
+                                                    cycle_df['cycle_number'] = cycle_idx
+                                                    cycles_list.append(cycle_df)
+                                    
+                                    if cycles_list:
+                                        # Combine all cycles into one DataFrame
+                                        cycles_data = pd.concat(cycles_list, ignore_index=True)
+                                        # Standardize column names
+                                        column_mapping_cycles = {
+                                            'V': 'voltage',
+                                            'I': 'current',
+                                            'T': 'temperature',
+                                            't': 'time',
+                                            'Qdlin': 'Qdlin'
+                                        }
+                                        cycles_data = cycles_data.rename(columns=column_mapping_cycles)
+                                        # Store cycles data for later use (dQ/dV plots, curve plots)
+                                        st.session_state.cycles_time_series = cycles_data
+                                
+                                # Extract other top-level variables if needed
+                                if 'cycle_life' in mat:
+                                    st.session_state.cycle_life = np.squeeze(mat['cycle_life'])
+                                if 'policy' in mat:
+                                    st.session_state.policy = mat.get('policy', None)
+                                if 'policy_readable' in mat:
+                                    st.session_state.policy_readable = mat.get('policy_readable', None)
+                                if 'Vdlin' in mat:
+                                    st.session_state.Vdlin = np.squeeze(mat['Vdlin'])
+                                
+                            except Exception as e:
+                                # If processing fails, silently fall through to generic parser
+                                # (Error message suppressed per user request)
+                                pass
+                        
+                        # If cell11dataset_for_python format was successfully parsed, skip generic parser
+                        if df is not None:
+                            cycle_data_mat = df
+                        else:
+                            # Try to reconstruct DataFrame from .mat
+                            # Look for cycle-level data first
+                            cycle_data_mat = None
                         
                         # Check for direct cycle column
                         if 'cycle' in mat or 'cycle_number' in mat:
@@ -1940,6 +2263,90 @@ with tab2:
                                     if key not in time_series[cycle_num]:
                                         time_series[cycle_num][key] = value
                         
+                        # Handle cycles_time_series from cell11dataset_for_python structure
+                        vc_all_cell11 = None
+                        ica_all_cell11 = None
+                        if 'cycles_time_series' in st.session_state:
+                            cycles_ts_df = st.session_state.cycles_time_series
+                            if cycles_ts_df is not None and len(cycles_ts_df) > 0:
+                                # Generate voltage-capacity curves and dQ/dV plots from cycles data
+                                vc_rows = []
+                                ica_rows = []
+                                
+                                # Check if we have the required columns
+                                has_voltage = 'voltage' in cycles_ts_df.columns or 'V' in cycles_ts_df.columns
+                                has_qdlin = 'Qdlin' in cycles_ts_df.columns or 'qdlin' in cycles_ts_df.columns
+                                
+                                if has_voltage and has_qdlin:
+                                    # Group by cycle_number
+                                    if 'cycle_number' in cycles_ts_df.columns:
+                                        for cycle_num in cycles_ts_df['cycle_number'].unique():
+                                            cycle_data = cycles_ts_df[cycles_ts_df['cycle_number'] == cycle_num].copy()
+                                            
+                                            # Get voltage and capacity
+                                            v_col = 'voltage' if 'voltage' in cycle_data.columns else 'V'
+                                            q_col = 'Qdlin' if 'Qdlin' in cycle_data.columns else 'qdlin'
+                                            
+                                            V = cycle_data[v_col].values
+                                            Q = cycle_data[q_col].values
+                                            
+                                            # Remove NaN and invalid values
+                                            valid_mask = np.isfinite(V) & np.isfinite(Q)
+                                            if np.sum(valid_mask) > 5:  # Need at least 5 points
+                                                V_clean = V[valid_mask]
+                                                Q_clean = Q[valid_mask]
+                                                
+                                                # Sort by voltage for proper plotting
+                                                sort_idx = np.argsort(V_clean)
+                                                V_clean = V_clean[sort_idx]
+                                                Q_clean = Q_clean[sort_idx]
+                                                
+                                                # Add to voltage-capacity curves
+                                                vc_rows.append(pd.DataFrame({
+                                                    'Voltage': V_clean,
+                                                    'Capacity_Ah': Q_clean,
+                                                    'Cycle': f'Cycle {int(cycle_num)}'
+                                                }))
+                                                
+                                                # Calculate dQ/dV for ICA plot
+                                                if SCIPY_OK and len(V_clean) > 3:
+                                                    try:
+                                                        # Use savgol_filter for smoothing if enough points
+                                                        if len(Q_clean) > 5:
+                                                            Q_smooth = savgol_filter(Q_clean, min(5, len(Q_clean)//2*2+1), 3)
+                                                        else:
+                                                            Q_smooth = Q_clean
+                                                        
+                                                        # Calculate dQ/dV
+                                                        dV = np.diff(V_clean)
+                                                        dQ = np.diff(Q_smooth)
+                                                        
+                                                        # Avoid division by zero
+                                                        valid_dv = np.abs(dV) > 1e-6
+                                                        if np.any(valid_dv):
+                                                            dQdV = np.zeros_like(V_clean)
+                                                            dQdV[1:][valid_dv] = dQ[valid_dv] / dV[valid_dv]
+                                                            dQdV[~valid_dv] = np.nan
+                                                            
+                                                            # Use voltage at mid-points for dQ/dV
+                                                            V_mid = (V_clean[:-1] + V_clean[1:]) / 2
+                                                            dQdV_mid = dQdV[1:]
+                                                            
+                                                            ica_rows.append(pd.DataFrame({
+                                                                'Voltage': V_mid,
+                                                                'dQdV': dQdV_mid,
+                                                                'Cycle': f'Cycle {int(cycle_num)}'
+                                                            }))
+                                                    except:
+                                                        pass
+                                
+                                if vc_rows:
+                                    vc_all_cell11 = pd.concat(vc_rows, ignore_index=True)
+                                    st.session_state.vc_all_cell11 = vc_all_cell11
+                                if ica_rows:
+                                    ica_all_cell11 = pd.concat(ica_rows, ignore_index=True)
+                                    st.session_state.ica_all_cell11 = ica_all_cell11
+                        
                         if cycle_data is None or len(cycle_data) == 0:
                             st.error("Could not parse cycle-level data. Please check column names.")
                             st.stop()
@@ -2253,6 +2660,50 @@ with tab2:
                                                     st.altair_chart(volt_chart, width='stretch')
                         
                         st.divider()
+                        
+                        # ============================================================
+                        # VOLTAGE-CAPACITY CURVES AND DQ/DV PLOTS (from cell11dataset_for_python)
+                        # ============================================================
+                        if 'vc_all_cell11' in st.session_state or 'ica_all_cell11' in st.session_state:
+                            st.markdown("### Voltage-Capacity Curves and dQ/dV Analysis")
+                            
+                            col_vc, col_ica = st.columns(2, gap="medium")
+                            
+                            # Plot voltage-capacity curves
+                            with col_vc:
+                                if 'vc_all_cell11' in st.session_state:
+                                    vc_data = st.session_state.vc_all_cell11
+                                    if vc_data is not None and len(vc_data) > 0:
+                                        vc_chart = alt.Chart(vc_data).mark_line(point={'size': 50}).encode(
+                                            x=alt.X("Voltage:Q", title="Voltage (V)", scale=alt.Scale(nice=True)),
+                                            y=alt.Y("Capacity_Ah:Q", title="Capacity (Ah)", scale=alt.Scale(nice=True)),
+                                            color=alt.Color("Cycle:N", title="Cycle"),
+                                            tooltip=['Voltage:Q', 'Capacity_Ah:Q', 'Cycle:N']
+                                        ).properties(title="Voltage vs Capacity", width=450, height=350)
+                                        st.altair_chart(vc_chart, width='stretch')
+                                    else:
+                                        st.info("No voltage-capacity data available")
+                                else:
+                                    st.info("Voltage-capacity curves not available")
+                            
+                            # Plot dQ/dV (ICA) curves
+                            with col_ica:
+                                if 'ica_all_cell11' in st.session_state:
+                                    ica_data = st.session_state.ica_all_cell11
+                                    if ica_data is not None and len(ica_data) > 0:
+                                        ica_chart = alt.Chart(ica_data).mark_line(point={'size': 50}).encode(
+                                            x=alt.X("Voltage:Q", title="Voltage (V)", scale=alt.Scale(nice=True)),
+                                            y=alt.Y("dQdV:Q", title="dQ/dV (Ah/V)", scale=alt.Scale(nice=True)),
+                                            color=alt.Color("Cycle:N", title="Cycle"),
+                                            tooltip=['Voltage:Q', 'dQdV:Q', 'Cycle:N']
+                                        ).properties(title="ICA: dQ/dV vs Voltage", width=450, height=350)
+                                        st.altair_chart(ica_chart, width='stretch')
+                                    else:
+                                        st.info("No dQ/dV data available")
+                                else:
+                                    st.info("dQ/dV curves not available")
+                            
+                            st.divider()
                         
                         # ============================================================
                         # DEGRADATION TREND ANALYSIS

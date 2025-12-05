@@ -38,6 +38,9 @@ except Exception:
 # Your temperature-aware engine module
 from batterylab_recipe_engine import ElectrodeSpec, CellDesignInput, design_pouch
 
+# Data cleaning module
+from cleaning_module import clean_dataframe, get_dataframe_info, to_csv_download, get_excel_sheets, read_excel_sheets, filter_channel_sheets, validate_analysis_compatibility, to_mat_download, export_to_cell11_mat_format
+
 # ---------------------------
 # Streamlit page config
 # ---------------------------
@@ -60,6 +63,10 @@ if "latest_design" not in st.session_state:
     st.session_state.latest_design = None   # {"spec_summary": {...}, "result": {...}}
 if "latest_analytics" not in st.session_state:
     st.session_state.latest_analytics = None  # {"features_by_group": {...}, "vc_all": DataFrame, "ica_all": DataFrame}
+if "cleaned_df" not in st.session_state:
+    st.session_state.cleaned_df = None
+if "cleaning_applied" not in st.session_state:
+    st.session_state.cleaning_applied = False
 
 # =========================
 # Helpers (shared)
@@ -83,45 +90,69 @@ def _standardize_columns(df: pd.DataFrame):
 def _detect_cycle_level_data(df: pd.DataFrame):
     """Detect if data is in cycle-level format (one row per cycle)"""
     cols_l = [c.lower() for c in df.columns]
-    has_cycle = any(c in ["cycle", "cycle_number", "cycle_idx"] for c in cols_l)
+    # Normalize column names (remove parentheses, spaces, underscores for matching)
+    cols_normalized = [c.replace('(', '').replace(')', '').replace(' ', '_').replace('-', '_') for c in cols_l]
+    
+    # Check for cycle column - expanded to include cycle_index
+    has_cycle = any(
+        c in ["cycle", "cycle_number", "cycle_idx", "cycle_index"] or 
+        c_norm in ["cycle", "cycle_number", "cycle_idx", "cycle_index"]
+        for c, c_norm in zip(cols_l, cols_normalized)
+    )
+    
     # Accept QDischarge, discharge_capacity, discharge_cap, capacity, cap, q
+    # Also handle Discharge_Capacity(Ah) format
     has_discharge_cap = any(
         "discharge_capacity" in c or "discharge_cap" in c or "qdischarge" in c or
-        (c in ["capacity", "cap", "q"] and "discharge" in " ".join(cols_l)) or c == "qdischarge"
-        for c in cols_l)
-    # Accept IR, internal_resistance, resistance
-    has_ir = any("internal_resistance" in c or c == "ir" or "resistance" in c or c == "ir" for c in cols_l)
+        (c in ["capacity", "cap", "q"] and "discharge" in " ".join(cols_l)) or c == "qdischarge" or
+        "dischargecapacity" in c_norm or "discharge_capacity" in c_norm
+        for c, c_norm in zip(cols_l, cols_normalized)
+    )
+    
+    # Accept IR, internal_resistance, resistance - handle Internal_Resistance(Ohm) format
+    has_ir = any(
+        "internal_resistance" in c or c == "ir" or "resistance" in c or 
+        "internalresistance" in c_norm or "internal_resistance" in c_norm
+        for c, c_norm in zip(cols_l, cols_normalized)
+    )
+    
     # Accept temperature, temp, tmax, tavg, tmin
     has_temp = any("temperature" in c or c == "temp" or c in ["tmax", "tavg", "tmin"] for c in cols_l)
+    
     return has_cycle and (has_discharge_cap or has_ir or has_temp)
 
 def _parse_cycle_level_data(df: pd.DataFrame):
     """Parse cycle-level data and extract cycle metrics"""
     cols_l = [c.lower() for c in df.columns]
+    # Normalize column names for matching
+    cols_normalized = [c.replace('(', '').replace(')', '').replace(' ', '_').replace('-', '_') for c in cols_l]
     
-    # Find cycle column
+    # Find cycle column - expanded to include cycle_index
     cycle_col = None
-    for i, c in enumerate(cols_l):
-        if c in ["cycle", "cycle_number", "cycle_idx"]:
+    for i, (c, c_norm) in enumerate(zip(cols_l, cols_normalized)):
+        if c in ["cycle", "cycle_number", "cycle_idx", "cycle_index"] or c_norm in ["cycle", "cycle_number", "cycle_idx", "cycle_index"]:
             cycle_col = df.columns[i]
             break
     
-    # Find discharge capacity
+    # Find discharge capacity - handle Discharge_Capacity(Ah) format
     cap_col = None
-    for i, c in enumerate(cols_l):
-        if "discharge_capacity" in c or "discharge_cap" in c or "qdischarge" in c or ("capacity" in c and "discharge" in " ".join(cols_l[:i+1])):
+    for i, (c, c_norm) in enumerate(zip(cols_l, cols_normalized)):
+        if ("discharge_capacity" in c or "discharge_cap" in c or "qdischarge" in c or 
+            "dischargecapacity" in c_norm or "discharge_capacity" in c_norm or
+            ("capacity" in c and "discharge" in " ".join(cols_l[:i+1]))):
             cap_col = df.columns[i]
             break
     if cap_col is None:
-        for i, c in enumerate(cols_l):
-            if c in ["capacity", "cap", "q", "discharge_cap", "qdischarge"]:
+        for i, (c, c_norm) in enumerate(zip(cols_l, cols_normalized)):
+            if c in ["capacity", "cap", "q", "discharge_cap", "qdischarge"] or "dischargecapacity" in c_norm:
                 cap_col = df.columns[i]
                 break
     
-    # Find internal resistance
+    # Find internal resistance - handle Internal_Resistance(Ohm) format
     ir_col = None
-    for i, c in enumerate(cols_l):
-        if "internal_resistance" in c or c == "ir" or "resistance" in c:
+    for i, (c, c_norm) in enumerate(zip(cols_l, cols_normalized)):
+        if ("internal_resistance" in c or c == "ir" or "resistance" in c or
+            "internalresistance" in c_norm or "internal_resistance" in c_norm):
             ir_col = df.columns[i]
             break
     
@@ -969,7 +1000,7 @@ def _copilot_reply(user_text: str, context: str = "general") -> str:
 # ---------------------------
 # Tabs
 # ---------------------------
-tab1, tab2 = st.tabs(["Recipe -> Performance", "Data Analytics (CSV/MAT)"])
+tab1, tab2, tab3 = st.tabs(["Recipe -> Performance", "Data Analytics (CSV/MAT)", "Cleaning Module"])
 
 # ==========
 # In-tab Copilot (sticky right column) – shared memory via st.session_state.chat_history
@@ -2195,27 +2226,61 @@ with tab2:
 
                         # Map likely roles for cycle-level datasets
                         cols_l = [c.lower() for c in cols]
+                        # Normalize column names for matching (remove parentheses, spaces, etc.)
+                        cols_normalized = [c.replace('(', '').replace(')', '').replace(' ', '_').replace('-', '_') for c in cols_l]
                         role_map = {}
-                        # cycle
-                        for cand in ["cycle", "cycle_number", "cycle_idx"]:
+                        
+                        # cycle - expanded to include cycle_index
+                        for cand in ["cycle", "cycle_number", "cycle_idx", "cycle_index"]:
                             if cand in cols_l:
                                 role_map['cycle'] = cols[cols_l.index(cand)]
                                 break
-                        # discharge capacity candidates
-                        for cand in ["qdischarge", "discharge_capacity", "discharge_cap", "qdis", "q_discharge"]:
+                            # Also check normalized names
+                            for i, c_norm in enumerate(cols_normalized):
+                                if cand == c_norm:
+                                    role_map['cycle'] = cols[i]
+                                    break
+                            if 'cycle' in role_map:
+                                break
+                        
+                        # discharge capacity candidates - handle Discharge_Capacity(Ah) format
+                        for cand in ["qdischarge", "discharge_capacity", "discharge_cap", "qdis", "q_discharge", "dischargecapacity"]:
                             if cand in cols_l:
                                 role_map['discharge_capacity'] = cols[cols_l.index(cand)]
                                 break
+                            # Also check normalized names
+                            for i, c_norm in enumerate(cols_normalized):
+                                if cand in c_norm or "dischargecapacity" in c_norm:
+                                    role_map['discharge_capacity'] = cols[i]
+                                    break
+                            if 'discharge_capacity' in role_map:
+                                break
+                        
                         # common capacity names
                         if 'discharge_capacity' not in role_map:
                             for cand in ['capacity', 'cap', 'q', 'q_ah', 'capacity_ah', 'qcharge', 'qcharge']:
                                 if cand in cols_l:
                                     role_map['discharge_capacity'] = cols[cols_l.index(cand)]
                                     break
-                        # IR
-                        for cand in ['internal_resistance', 'ir', 'resistance']:
+                                # Also check normalized names
+                                for i, c_norm in enumerate(cols_normalized):
+                                    if cand in c_norm and "discharge" in cols_l[i]:
+                                        role_map['discharge_capacity'] = cols[i]
+                                        break
+                                if 'discharge_capacity' in role_map:
+                                    break
+                        
+                        # IR - handle Internal_Resistance(Ohm) format
+                        for cand in ['internal_resistance', 'ir', 'resistance', 'internalresistance']:
                             if cand in cols_l:
                                 role_map['internal_resistance'] = cols[cols_l.index(cand)]
+                                break
+                            # Also check normalized names
+                            for i, c_norm in enumerate(cols_normalized):
+                                if cand in c_norm or "internalresistance" in c_norm:
+                                    role_map['internal_resistance'] = cols[i]
+                                    break
+                            if 'internal_resistance' in role_map:
                                 break
                         # Temperature
                         for cand in ['tavg', 'temperature', 'temp', 'tmax', 'tmin']:
@@ -3041,3 +3106,589 @@ plt.show()
 
     with col_chat:
         render_copilot(context_key="tab2", default_context="Analytics")
+
+# =========================
+# TAB 3: Cleaning Module WITH in-tab Copilot
+# =========================
+with tab3:
+    col_main, col_chat = st.columns([0.68, 0.32], gap="large")
+    
+    with col_main:
+        st.subheader("Data Cleaning Module")
+        st.write(
+            "Upload a CSV or Excel file to clean and download the cleaned version. "
+            "Configure cleaning options below to customize the cleaning process."
+        )
+        
+        # File uploader
+        uploaded_file = st.file_uploader(
+            "Upload CSV or Excel file",
+            type=["csv", "xlsx", "xls"],
+            help="Supported formats: .csv, .xlsx, .xls"
+        )
+        
+        if uploaded_file is not None:
+            # Read the file
+            try:
+                file_extension = uploaded_file.name.lower().split('.')[-1]
+                is_excel = file_extension in ['xlsx', 'xls']
+                is_multi_sheet = False
+                all_sheets = []
+                channel_sheets = []
+                selected_sheets = []
+                sheets_data = {}
+                
+                if file_extension == 'csv':
+                    df_original = pd.read_csv(uploaded_file)
+                    st.session_state.file_type = 'csv'
+                elif is_excel:
+                    try:
+                        # Try importing openpyxl first
+                        import openpyxl
+                        # Check if Excel file has multiple sheets
+                        all_sheets = get_excel_sheets(uploaded_file)
+                        channel_sheets = filter_channel_sheets(all_sheets)
+                        
+                        if len(all_sheets) > 1:
+                            is_multi_sheet = True
+                            st.session_state.file_type = 'excel_multi'
+                            st.session_state.all_sheets = all_sheets
+                            st.session_state.channel_sheets = channel_sheets
+                            
+                            # Show sheet information
+                            st.info(f"Found {len(all_sheets)} sheet(s): {', '.join(all_sheets)}")
+                            if 'info' in [s.lower() for s in all_sheets]:
+                                st.info("'info' sheet detected and will be excluded from processing.")
+                            
+                            if len(channel_sheets) > 0:
+                                st.success(f"Found {len(channel_sheets)} Channel sheet(s): {', '.join(channel_sheets)}")
+                                
+                                # Sheet selection
+                                st.subheader("Sheet Selection")
+                                selected_sheets = st.multiselect(
+                                    "Select sheets to process",
+                                    options=channel_sheets,
+                                    default=channel_sheets,  # Select all Channel sheets by default
+                                    help="Select which Channel sheets to clean and combine"
+                                )
+                                
+                                if len(selected_sheets) == 0:
+                                    st.warning("Please select at least one sheet to process.")
+                                    st.stop()
+                                
+                                # Read selected sheets
+                                uploaded_file.seek(0)  # Reset file pointer
+                                sheets_data = read_excel_sheets(uploaded_file, selected_sheets)
+                                
+                                # Combine selected sheets
+                                dfs_to_combine = []
+                                for sheet_name in selected_sheets:
+                                    if sheet_name in sheets_data:
+                                        df_sheet = sheets_data[sheet_name].copy()
+                                        # Add a column to identify the source sheet
+                                        df_sheet.insert(0, 'Sheet_Source', sheet_name)
+                                        dfs_to_combine.append(df_sheet)
+                                
+                                if len(dfs_to_combine) > 0:
+                                    df_original = pd.concat(dfs_to_combine, ignore_index=True)
+                                    st.success(f"Combined {len(selected_sheets)} sheet(s): {', '.join(selected_sheets)}")
+                                else:
+                                    st.error("No data found in selected sheets.")
+                                    st.stop()
+                            else:
+                                st.warning("No 'Channel_' sheets found. Processing all sheets except 'info'.")
+                                # Process all sheets except 'info'
+                                sheets_to_process = [s for s in all_sheets if s.lower() != 'info']
+                                if len(sheets_to_process) == 0:
+                                    st.error("No sheets available for processing.")
+                                    st.stop()
+                                
+                                selected_sheets = st.multiselect(
+                                    "Select sheets to process",
+                                    options=sheets_to_process,
+                                    default=sheets_to_process,
+                                    help="Select which sheets to clean and combine"
+                                )
+                                
+                                if len(selected_sheets) == 0:
+                                    st.warning("Please select at least one sheet to process.")
+                                    st.stop()
+                                
+                                uploaded_file.seek(0)
+                                sheets_data = read_excel_sheets(uploaded_file, selected_sheets)
+                                
+                                dfs_to_combine = []
+                                for sheet_name in selected_sheets:
+                                    if sheet_name in sheets_data:
+                                        df_sheet = sheets_data[sheet_name].copy()
+                                        df_sheet.insert(0, 'Sheet_Source', sheet_name)
+                                        dfs_to_combine.append(df_sheet)
+                                
+                                if len(dfs_to_combine) > 0:
+                                    df_original = pd.concat(dfs_to_combine, ignore_index=True)
+                                    st.success(f"Combined {len(selected_sheets)} sheet(s): {', '.join(selected_sheets)}")
+                                else:
+                                    st.error("No data found in selected sheets.")
+                                    st.stop()
+                        else:
+                            # Single sheet Excel file
+                            df_original = pd.read_excel(uploaded_file)
+                            st.session_state.file_type = 'excel_single'
+                    except ImportError as e:
+                        st.error(f"Excel file support requires 'openpyxl' package. Error: {str(e)}")
+                        st.info("**To fix this:**\n1. Make sure you're using the virtual environment Python\n2. Install with: `.venv\\Scripts\\python.exe -m pip install openpyxl`\n3. Or activate venv first: `.venv\\Scripts\\Activate.ps1` then `pip install openpyxl`")
+                        st.stop()
+                    except Exception as e:
+                        st.error(f"Error reading Excel file: {str(e)}")
+                        st.info("**Troubleshooting:**\n- Make sure the file is a valid Excel file (.xlsx or .xls)\n- Check if the file is corrupted\n- Try opening it in Excel first to verify it's valid")
+                        st.stop()
+                else:
+                    st.error("Unsupported file format. Please upload a CSV or Excel file.")
+                    st.stop()
+                
+                st.success(f"File loaded successfully! Shape: {df_original.shape[0]} rows × {df_original.shape[1]} columns")
+                
+                # Store original dataframe and info in session state
+                st.session_state.df_original = df_original
+                info_original = get_dataframe_info(df_original)
+                st.session_state.info_original = info_original
+                
+                # Display original data info
+                with st.expander("Original Data Information", expanded=False):
+                    st.write(f"**Shape:** {info_original['shape'][0]} rows × {info_original['shape'][1]} columns")
+                    st.write(f"**Memory Usage:** {info_original['memory_usage']:.2f} MB")
+                    st.write(f"**Duplicate Rows:** {info_original['duplicate_rows']}")
+                    
+                    if info_original['null_counts']:
+                        st.write("**Missing Values:**")
+                        null_df = pd.DataFrame({
+                            'Column': list(info_original['null_counts'].keys()),
+                            'Null Count': list(info_original['null_counts'].values()),
+                            'Null %': [f"{info_original['null_percentages'][k]:.2f}%" 
+                                       for k in info_original['null_counts'].keys()]
+                        })
+                        st.dataframe(null_df, use_container_width=True)
+                
+                # Preview original data
+                with st.expander("Preview Original Data", expanded=False):
+                    st.dataframe(df_original.head(10), use_container_width=True)
+                
+                # Cleaning options
+                st.subheader("Cleaning Options")
+                
+                # Basic options
+                col1, col2 = st.columns(2)
+                
+                with col1:
+                    remove_duplicates = st.checkbox("Remove duplicate rows", value=True)
+                    remove_empty_rows = st.checkbox("Remove completely empty rows", value=True)
+                    remove_empty_cols = st.checkbox("Remove completely empty columns", value=True)
+                    standardize_names = st.checkbox("Standardize column names (lowercase, underscores)", value=False)
+                    trim_whitespace = st.checkbox("Trim whitespace in text columns", value=True)
+                    convert_numeric = st.checkbox("Convert columns to numeric where possible", value=False)
+                
+                with col2:
+                    fill_na_method = st.selectbox(
+                        "Handle missing values",
+                        options=['drop', 'forward', 'backward', 'interpolate', 'mean', 'median', 'zero', 'custom'],
+                        index=0,
+                        help="Choose how to handle NaN values. 'interpolate' only fills small gaps (<5 samples)."
+                    )
+                    
+                    fill_na_value = None
+                    if fill_na_method == 'custom':
+                        fill_na_value = st.number_input("Custom fill value", value=0.0)
+                    
+                    gap_threshold = st.number_input("Gap threshold (samples)", min_value=1, value=5, 
+                                                    help="Gaps larger than this won't be interpolated")
+                    
+                    remove_outliers = st.checkbox("Remove outliers (statistical)", value=False)
+                    outlier_method = None
+                    if remove_outliers:
+                        outlier_method = st.selectbox(
+                            "Outlier detection method",
+                            options=['iqr', 'zscore'],
+                            index=0,
+                            help="IQR: Interquartile Range method, Z-score: Standard deviation method"
+                        )
+                
+                harmonize_schema = st.checkbox("Harmonize to standard schema", value=True)
+                detect_cycler = st.checkbox("Auto-detect cycler format", value=True)
+                
+                col_phase2_1, col_phase2_2 = st.columns(2)
+                
+                with col_phase2_1:
+                    segment_steps = st.checkbox("Segment steps and cycles", value=True)
+                    assign_step_types = st.checkbox("Assign step types", value=True)
+                    identify_rpt = st.checkbox("Identify RPT cycles", value=True)
+                
+                with col_phase2_2:
+                    detect_anomalies = st.checkbox("Detect statistical anomalies", value=True)
+                    anomaly_method = 'zscore'
+                    anomaly_window_size = 10
+                    if detect_anomalies:
+                        anomaly_method = st.selectbox(
+                            "Anomaly detection method",
+                            options=['zscore', 'lof'],
+                            index=0,
+                            help="Z-Score: Moving window statistical method. LOF: Local Outlier Factor (requires scikit-learn)"
+                        )
+                        anomaly_window_size = st.number_input("Anomaly window size", min_value=5, value=10, step=1)
+                    
+                    correct_anomalies = st.checkbox("Correct detected anomalies", value=True)
+                    correction_method = 'savgol'
+                    if correct_anomalies:
+                        correction_method = st.selectbox(
+                            "Correction method",
+                            options=['savgol', 'interpolate', 'median_filter'],
+                            index=0,
+                            help="Savitzky-Golay: Best for preserving curve shape. Interpolate: Linear interpolation. Median: Simple median filter"
+                        )
+                
+                col_missing_1, col_missing_2 = st.columns(2)
+                with col_missing_1:
+                    detect_missing_data = st.checkbox("Detect missing data gaps", value=True)
+                    max_gap_seconds = 60.0
+                    if detect_missing_data:
+                        max_gap_seconds = st.number_input("Max gap (seconds)", min_value=1.0, value=60.0, step=1.0)
+                
+                with col_missing_2:
+                    impute_missing = st.checkbox("Impute missing data", value=True)
+                    imputation_method = 'linear'
+                    if impute_missing:
+                        imputation_method = st.selectbox(
+                            "Imputation method",
+                            options=['linear', 'cubic', 'forward_fill'],
+                            index=0,
+                            help="Linear: Fast interpolation. Cubic: Smoother curves. Forward fill: Simple fill"
+                        )
+                
+                verify_electrochemical = st.checkbox("Verify electrochemical anomalies (CE, Capacity Drift)", value=True)
+                
+                col_phase3_1, col_phase3_2 = st.columns(2)
+                
+                with col_phase3_1:
+                    resample_capacity_axis = st.checkbox("Resample to uniform capacity axis", value=False)
+                    capacity_points = 1000
+                    if resample_capacity_axis:
+                        capacity_points = st.number_input("Capacity grid points", min_value=100, value=1000, step=100)
+                    
+                    resample_voltage_axis = st.checkbox("Resample to uniform voltage axis", value=False)
+                    voltage_points = 1000
+                    if resample_voltage_axis:
+                        voltage_points = st.number_input("Voltage grid points", min_value=100, value=1000, step=100)
+                
+                with col_phase3_2:
+                    smooth_for_derivatives = st.checkbox("Smooth for derivative calculation (Savitzky-Golay)", value=False)
+                    savgol_window = 11
+                    savgol_polyorder = 3
+                    if smooth_for_derivatives:
+                        savgol_window = st.number_input("Savitzky-Golay window", min_value=5, value=11, step=2, 
+                                                       help="Must be odd number")
+                        savgol_polyorder = st.number_input("Polynomial order", min_value=1, max_value=5, value=3)
+                
+                # Range filtering options - initialize defaults
+                apply_range_filters = False
+                range_filters = {}
+                
+                with st.expander("Value Range Filtering (Set Out-of-Range Values to 0)", expanded=False):
+                    st.markdown("""
+                    **Battery Data Range Filtering:**
+                    - Select columns and set acceptable value ranges
+                    - Values outside the range will be replaced with 0 (or a custom value)
+                    - Use battery-specific defaults or set custom ranges
+                    """)
+                    
+                    apply_range_filters = st.checkbox("Apply range filters (replace out-of-range with 0)", value=False)
+                    
+                    if apply_range_filters:
+                        # Get numeric columns
+                        numeric_cols = [c for c in df_original.columns 
+                                       if pd.api.types.is_numeric_dtype(df_original[c])]
+                        
+                        if numeric_cols:
+                            # Import battery defaults
+                            from cleaning_module import get_battery_default_ranges
+                            battery_defaults = get_battery_default_ranges()
+                            
+                            # Column selection
+                            selected_filter_cols = st.multiselect(
+                                "Select columns to apply range filters",
+                                options=numeric_cols,
+                                default=[],
+                                help="Choose which columns to filter. Values outside range will be set to 0."
+                            )
+                            
+                            if selected_filter_cols:
+                                st.markdown("---")
+                                st.markdown("**Set Range for Each Column**")
+                                
+                                # Quick apply battery defaults button
+                                if st.button("Apply Battery Default Ranges", help="Apply sensible defaults for common battery parameters"):
+                                    st.info("Battery defaults applied! Adjust ranges below if needed.")
+                                
+                                for col in selected_filter_cols:
+                                    # Try to match column to battery defaults
+                                    col_lower = col.lower()
+                                    default_range = None
+                                    default_unit = ""
+                                    
+                                    for pattern, default in battery_defaults.items():
+                                        if pattern in col_lower:
+                                            default_range = default
+                                            default_unit = default.get('unit', '')
+                                            break
+                                    
+                                    # Get current data range
+                                    col_min_data = float(df_original[col].min()) if len(df_original) > 0 else 0.0
+                                    col_max_data = float(df_original[col].max()) if len(df_original) > 0 else 100.0
+                                    
+                                    # Use battery default if available, otherwise use data range
+                                    if default_range:
+                                        default_min = default_range['min']
+                                        default_max = default_range['max']
+                                        default_replace = default_range.get('replace_with', 0.0)
+                                        st.markdown(f"**{col}** {default_unit} (Battery default range)")
+                                    else:
+                                        default_min = col_min_data
+                                        default_max = col_max_data
+                                        default_replace = 0.0
+                                        st.markdown(f"**{col}**")
+                                    
+                                    # Create columns for inputs
+                                    filter_col1, filter_col2, filter_col3 = st.columns(3)
+                                    
+                                    with filter_col1:
+                                        min_val = st.number_input(
+                                            f"Min value",
+                                            value=default_min,
+                                            key=f"range_min_{col}",
+                                            step=0.01 if abs(default_max - default_min) < 100 else 1.0,
+                                            help=f"Data range: {col_min_data:.4f} to {col_max_data:.4f}"
+                                        )
+                                    
+                                    with filter_col2:
+                                        max_val = st.number_input(
+                                            f"Max value",
+                                            value=default_max,
+                                            key=f"range_max_{col}",
+                                            step=0.01 if abs(default_max - default_min) < 100 else 1.0,
+                                            help=f"Data range: {col_min_data:.4f} to {col_max_data:.4f}"
+                                        )
+                                    
+                                    with filter_col3:
+                                        replace_val = st.number_input(
+                                            f"Replace with",
+                                            value=default_replace,
+                                            key=f"range_replace_{col}",
+                                            step=0.01,
+                                            help="Value to use for out-of-range data (default: 0)"
+                                        )
+                                    
+                                    # Show data statistics
+                                    out_of_range_count = 0
+                                    if len(df_original) > 0:
+                                        out_of_range_mask = (
+                                            (df_original[col] < min_val) | 
+                                            (df_original[col] > max_val)
+                                        )
+                                        out_of_range_count = out_of_range_mask.sum()
+                                        out_of_range_pct = (out_of_range_count / len(df_original)) * 100
+                                        
+                                        if out_of_range_count > 0:
+                                            st.warning(f"{out_of_range_count} values ({out_of_range_pct:.1f}%) will be replaced with {replace_val}")
+                                        else:
+                                            st.success(f"All values are within range")
+                                    
+                                    range_filters[col] = {
+                                        'min': min_val, 
+                                        'max': max_val,
+                                        'replace_with': replace_val
+                                    }
+                                    
+                                    st.markdown("---")
+                        else:
+                            st.info("No numeric columns found for range filtering.")
+                
+                
+                # Clean button
+                if st.button("Clean Data", type="primary", use_container_width=True):
+                    with st.spinner("Cleaning data..."):
+                        # Use stored dataframe if available, otherwise use current
+                        df_to_clean = st.session_state.get('df_original', df_original)
+                        
+                        cleaning_options = {
+                            # Basic options
+                            'remove_duplicates': remove_duplicates,
+                            'remove_empty_rows': remove_empty_rows,
+                            'remove_empty_cols': remove_empty_cols,
+                            'fill_na_method': fill_na_method,
+                            'fill_na_value': fill_na_value,
+                            'gap_threshold': gap_threshold,
+                            'remove_outliers': remove_outliers,
+                            'outlier_method': outlier_method,
+                            'standardize_names': standardize_names,
+                            'trim_whitespace': trim_whitespace,
+                            'convert_numeric': convert_numeric,
+                            # Phase 1: Data Ingestion and Harmonization
+                            'harmonize_schema': harmonize_schema,
+                            'detect_cycler': detect_cycler,
+                            # Phase 2: Anomaly Detection and Correction
+                            'segment_steps': segment_steps,
+                            'assign_step_types': assign_step_types,
+                            'identify_rpt': identify_rpt,
+                            'detect_anomalies': detect_anomalies,
+                            'anomaly_method': anomaly_method,
+                            'anomaly_window_size': anomaly_window_size,
+                            'correct_anomalies': correct_anomalies,
+                            'correction_method': correction_method,
+                            'detect_missing_data': detect_missing_data,
+                            'max_gap_seconds': max_gap_seconds,
+                            'impute_missing': impute_missing,
+                            'imputation_method': imputation_method,
+                            'verify_electrochemical': verify_electrochemical,
+                            # Phase 3: Preprocessing for Feature Extraction
+                            'resample_capacity_axis': resample_capacity_axis,
+                            'capacity_points': capacity_points,
+                            'resample_voltage_axis': resample_voltage_axis,
+                            'voltage_points': voltage_points,
+                            'smooth_for_derivatives': smooth_for_derivatives,
+                            'savgol_window': savgol_window,
+                            'savgol_polyorder': savgol_polyorder,
+                            # Range filtering
+                            'apply_range_filters': apply_range_filters,
+                            'range_filters': range_filters
+                        }
+                        
+                        df_cleaned = clean_dataframe(df_to_clean, cleaning_options)
+                        
+                        # Store in session state for download
+                        st.session_state.cleaned_df = df_cleaned
+                        st.session_state.cleaning_applied = True
+                
+                # Display cleaned data if available
+                if st.session_state.get('cleaning_applied', False) and 'cleaned_df' in st.session_state:
+                    df_cleaned = st.session_state.cleaned_df
+                    info_original = st.session_state.get('info_original', {})
+                    
+                    st.subheader("Cleaned Data")
+                    
+                    # Display cleaned data info
+                    with st.expander("Cleaned Data Information", expanded=True):
+                        info_cleaned = get_dataframe_info(df_cleaned)
+                        st.write(f"**Shape:** {info_cleaned['shape'][0]} rows × {info_cleaned['shape'][1]} columns")
+                        st.write(f"**Memory Usage:** {info_cleaned['memory_usage']:.2f} MB")
+                        st.write(f"**Duplicate Rows:** {info_cleaned['duplicate_rows']}")
+                        
+                        # Show changes
+                        if info_original and 'shape' in info_original:
+                            rows_removed = info_original['shape'][0] - info_cleaned['shape'][0]
+                            cols_removed = info_original['shape'][1] - info_cleaned['shape'][1]
+                            if rows_removed > 0 or cols_removed > 0:
+                                st.info(f"Removed {rows_removed} rows and {cols_removed} columns")
+                        
+                        if info_cleaned['null_counts']:
+                            st.write("**Missing Values (after cleaning):**")
+                            null_df = pd.DataFrame({
+                                'Column': list(info_cleaned['null_counts'].keys()),
+                                'Null Count': list(info_cleaned['null_counts'].values()),
+                                'Null %': [f"{info_cleaned['null_percentages'][k]:.2f}%" 
+                                           for k in info_cleaned['null_counts'].keys()]
+                            })
+                            st.dataframe(null_df, use_container_width=True)
+                    
+                    # Preview cleaned data
+                    with st.expander("Preview Cleaned Data", expanded=True):
+                        st.dataframe(df_cleaned.head(10), use_container_width=True)
+                    
+                    # Compatibility validation
+                    compatibility = validate_analysis_compatibility(df_cleaned)
+                    
+                    # Download section
+                    st.subheader("Download Cleaned Data")
+                    
+                    # Show compatibility status
+                    if compatibility['is_compatible']:
+                        st.success(f"Compatible with Analysis Module (Format: {compatibility['format_type'].replace('_', ' ').title()})")
+                    else:
+                        st.warning("Data format may not be recognized by Analysis Module. Ensure you have required columns (cycle/discharge_capacity or Voltage/Capacity).")
+                    
+                    # Show warnings if any
+                    if compatibility['warnings']:
+                        for warning in compatibility['warnings']:
+                            st.info(f"{warning}")
+                    
+                    # Download options
+                    col_dl1, col_dl2 = st.columns(2)
+                    
+                    with col_dl1:
+                        remove_sheet_source = st.checkbox(
+                            "Remove 'Sheet_Source' column for analysis compatibility",
+                            value=('Sheet_Source' in df_cleaned.columns),
+                            help="The Sheet_Source column (added when combining multiple sheets) may interfere with analysis. Remove it for better compatibility."
+                        )
+                    
+                    with col_dl2:
+                        download_format = st.radio(
+                            "Download format",
+                            options=["CSV", "Excel"],
+                            index=0,
+                            horizontal=True
+                        )
+                    
+                    # Generate download data
+                    if download_format == "CSV":
+                        csv_data = to_csv_download(df_cleaned, "cleaned_data.csv", remove_sheet_source=remove_sheet_source)
+                        st.download_button(
+                            label="Download Cleaned CSV",
+                            data=csv_data,
+                            file_name="cleaned_data.csv",
+                            mime="text/csv",
+                            type="primary",
+                            use_container_width=True
+                        )
+                    elif download_format == "Excel":
+                        # Create Excel file in memory
+                        excel_buffer = BytesIO()
+                        df_export = df_cleaned.copy()
+                        if remove_sheet_source and 'Sheet_Source' in df_export.columns:
+                            df_export = df_export.drop(columns=['Sheet_Source'])
+                        
+                        with pd.ExcelWriter(excel_buffer, engine='openpyxl') as writer:
+                            df_export.to_excel(writer, index=False, sheet_name='Cleaned_Data')
+                        excel_buffer.seek(0)
+                        
+                        st.download_button(
+                            label="Download Cleaned Excel",
+                            data=excel_buffer.getvalue(),
+                            file_name="cleaned_data.xlsx",
+                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                            type="primary",
+                            use_container_width=True
+                        )
+                    else:  # MAT format (cell11dataset_for_python.mat)
+                        try:
+                            mat_filename = f"{cell_id}dataset_for_python.mat"
+                            mat_data = to_mat_download(df_cleaned, mat_filename, cell_id=cell_id)
+                            st.download_button(
+                                label=f"Download {mat_filename}",
+                                data=mat_data,
+                                file_name=mat_filename,
+                                mime="application/octet-stream",
+                                type="primary",
+                                use_container_width=True
+                            )
+                            st.info(f"Data will be saved in cell11dataset_for_python.mat format with cell ID: {cell_id}")
+                        except ImportError:
+                            st.error("SciPy is required for .mat export. Install with: pip install scipy")
+                        except Exception as e:
+                            st.error(f"Error creating .mat file: {str(e)}")
+                    
+            except Exception as e:
+                st.error(f"Error processing file: {str(e)}")
+                st.exception(e)
+        else:
+            st.info(" Please upload a CSV or Excel file to get started with data cleaning.")
+    
+    with col_chat:
+        render_copilot(context_key="tab3", default_context="Analytics")

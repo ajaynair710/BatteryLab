@@ -70,6 +70,17 @@ STANDARD_SCHEMA = {
 }
 
 CYCLER_PARSERS = {
+    'calce': {
+        'cycle_cols': ['Cycle', 'Cycle_Index', 'Cycle Number'],
+        'step_cols': ['Step', 'Step_Index', 'Step Number'],
+        'current_cols': ['Current', 'I', 'Current(A)', 'Current_A'],
+        'voltage_cols': ['Voltage', 'V', 'Voltage(V)', 'Voltage_V'],
+        'capacity_cols': ['Capacity', 'Q', 'Capacity(Ah)', 'Capacity_Ah'],
+        'temp_cols': ['Temperature', 'Temp', 'Temperature(C)', 'Temperature_C'],
+        'time_cols': ['Step_Time', 'Time', 'Test_Time', 'Time(s)'],
+        'datetime_cols': ['Step_Time'],  # Excel serial time
+        'excel_serial_origin': '1899-12-30'  # CALCE uses Excel serial time
+    },
     'arbin': {
         'cycle_cols': ['Cycle_Index', 'Cycle', 'Cycle_Number'],
         'step_cols': ['Step_Index', 'Step', 'Step_Number'],
@@ -118,7 +129,7 @@ CYCLER_PARSERS = {
 }
 
 
-def detect_cycler_format(df: pd.DataFrame) -> str:
+def detect_cycler_format(df: pd.DataFrame, metadata: dict = None) -> str:
     """
     Detect which cycler format the data is from.
     
@@ -126,17 +137,55 @@ def detect_cycler_format(df: pd.DataFrame) -> str:
     -----------
     df : pd.DataFrame
         Input dataframe
+    metadata : dict, optional
+        Metadata dict that may contain format hints (e.g., from Excel headers)
     
     Returns:
     --------
     str
-        Detected cycler format ('arbin', 'biologic', 'neware', 'maccor', 'solartron', 'unknown')
+        Detected cycler format ('calce', 'arbin', 'biologic', 'neware', 'maccor', 'solartron', 'severson', 'unknown')
     """
     cols_l = [c.lower() for c in df.columns]
     
+    # Check for CALCE format first (has Step_Time column with Excel serial time)
+    if 'step_time' in cols_l:
+        # Check if values look like Excel serial days (typically > 40000 for modern dates)
+        step_time_col = None
+        for col in df.columns:
+            if col.lower() == 'step_time':
+                step_time_col = col
+                break
+        
+        if step_time_col is not None:
+            sample_values = df[step_time_col].dropna().head(100)
+            if len(sample_values) > 0:
+                # Excel serial days are typically > 40000 for dates after 2009
+                if sample_values.min() > 40000 or (sample_values.min() > 1000 and sample_values.max() < 1000000):
+                    return 'calce'
+    
+    # Check metadata for format hints
+    if metadata:
+        if 'format' in metadata and metadata['format']:
+            return metadata['format'].lower()
+        if 'cycler' in metadata and metadata['cycler']:
+            cycler_name = str(metadata['cycler']).lower()
+            if 'calce' in cycler_name:
+                return 'calce'
+    
+    # Check for Severson .mat format (has specific structure)
+    if 'cycle_life' in cols_l or 'capacity' in cols_l:
+        # Additional checks for Severson format
+        if any('summary' in c for c in cols_l) or any('cycles' in c for c in cols_l):
+            return 'severson'
+    
+    # Check other cycler formats
     for cycler, patterns in CYCLER_PARSERS.items():
+        if cycler == 'calce':  # Already checked
+            continue
         matches = 0
         for key, col_list in patterns.items():
+            if key in ['excel_serial_origin', 'datetime_cols']:
+                continue
             for col_pattern in col_list:
                 if any(col_pattern.lower() in c for c in cols_l):
                     matches += 1
@@ -239,16 +288,27 @@ def harmonize_to_standard_schema(df: pd.DataFrame, cycler_format: str = None) ->
     # Apply mapping
     df_clean = df_clean.rename(columns=mapping)
     
-    # Normalize time to seconds
-    if 'Time' in df_clean.columns:
-        df_clean = normalize_time_to_seconds(df_clean)
-    
-    # Ensure datetime column exists
-    if 'DateTime' not in df_clean.columns:
+    # Handle CALCE Excel serial time conversion (CRITICAL FIX for Issue 1)
+    if cycler_format == 'calce' and 'Step_Time' in df_clean.columns:
+        # CALCE uses Excel serial time (days since 1899-12-30)
+        origin = pd.Timestamp("1899-12-30")
+        df_clean['DateTime'] = origin + pd.to_timedelta(df_clean['Step_Time'], unit="D")
+        # Also create Time column in seconds from DateTime
+        if 'Time' not in df_clean.columns:
+            df_clean['Time'] = (df_clean['DateTime'] - df_clean['DateTime'].min()).dt.total_seconds()
+    else:
+        # Normalize time to seconds for other formats
         if 'Time' in df_clean.columns:
-            df_clean['DateTime'] = pd.to_datetime(df_clean.index, errors='coerce')
-        else:
-            df_clean['DateTime'] = pd.Timestamp.now()
+            df_clean = normalize_time_to_seconds(df_clean)
+        
+        # Ensure datetime column exists
+        if 'DateTime' not in df_clean.columns:
+            if 'Time' in df_clean.columns:
+                # Try to create DateTime from Time (assuming relative to test start)
+                test_start = pd.Timestamp.now() - pd.Timedelta(seconds=df_clean['Time'].max())
+                df_clean['DateTime'] = test_start + pd.to_timedelta(df_clean['Time'], unit='s')
+            else:
+                df_clean['DateTime'] = pd.Timestamp.now()
     
     return df_clean
 
@@ -300,6 +360,7 @@ def normalize_time_to_seconds(df: pd.DataFrame) -> pd.DataFrame:
 def segment_steps_and_cycles(df: pd.DataFrame) -> pd.DataFrame:
     """
     Identify and correct step boundaries and cycle isolation.
+    Creates clean cycle boundaries for proper cycle-level analysis.
     
     Parameters:
     -----------
@@ -313,12 +374,11 @@ def segment_steps_and_cycles(df: pd.DataFrame) -> pd.DataFrame:
     """
     df_clean = df.copy()
     
-    if 'Step_Index' not in df_clean.columns or 'Current' not in df_clean.columns:
-        return df_clean
-    
-    # Sort by time
+    # Sort by time first
     if 'Time' in df_clean.columns:
         df_clean = df_clean.sort_values('Time').reset_index(drop=True)
+    elif 'DateTime' in df_clean.columns:
+        df_clean = df_clean.sort_values('DateTime').reset_index(drop=True)
     
     # Detect step boundaries based on current changes
     if 'Current' in df_clean.columns:
@@ -330,7 +390,7 @@ def segment_steps_and_cycles(df: pd.DataFrame) -> pd.DataFrame:
         
         # Correct Step_Index if missing or incorrect
         if 'Step_Index' in df_clean.columns:
-            step_idx = 1
+            step_idx = df_clean['Step_Index'].iloc[0] if len(df_clean) > 0 else 1
             for i in range(1, len(df_clean)):
                 if step_boundaries.iloc[i]:
                     step_idx += 1
@@ -344,21 +404,47 @@ def segment_steps_and_cycles(df: pd.DataFrame) -> pd.DataFrame:
                 step_indices.append(step_idx)
             df_clean['Step_Index'] = step_indices
     
-    # Correct Cycle_Index if missing
-    if 'Cycle_Index' not in df_clean.columns and 'Step_Index' in df_clean.columns:
-        # Assume cycle changes when step resets to 1
-        cycle_idx = 1
-        cycle_indices = [1]
-        prev_step = df_clean['Step_Index'].iloc[0]
-        
-        for i in range(1, len(df_clean)):
-            current_step = df_clean['Step_Index'].iloc[i]
-            if current_step < prev_step:  # Step reset indicates new cycle
-                cycle_idx += 1
-            cycle_indices.append(cycle_idx)
-            prev_step = current_step
-        
-        df_clean['Cycle_Index'] = cycle_indices
+    # Correct Cycle_Index if missing or create clean cycle boundaries (Issue 2 Fix)
+    if 'Cycle_Index' not in df_clean.columns or df_clean['Cycle_Index'].isna().any():
+        if 'Step_Index' in df_clean.columns:
+            # Assume cycle changes when step resets to 1 or when current sign changes
+            cycle_idx = 1
+            cycle_indices = [1]
+            prev_step = df_clean['Step_Index'].iloc[0] if len(df_clean) > 0 else 1
+            prev_current_sign = 0
+            
+            for i in range(1, len(df_clean)):
+                current_step = df_clean['Step_Index'].iloc[i]
+                current_sign = 1 if df_clean['Current'].iloc[i] > 0.01 else (-1 if df_clean['Current'].iloc[i] < -0.01 else 0)
+                
+                # New cycle if step resets OR if we transition from charge to discharge (or vice versa)
+                if current_step < prev_step or (prev_current_sign != 0 and current_sign != 0 and current_sign != prev_current_sign):
+                    cycle_idx += 1
+                
+                cycle_indices.append(cycle_idx)
+                prev_step = current_step
+                prev_current_sign = current_sign
+            
+            df_clean['Cycle_Index'] = cycle_indices
+        else:
+            # No step info, create cycles based on current sign changes
+            if 'Current' in df_clean.columns:
+                cycle_idx = 1
+                cycle_indices = [1]
+                prev_sign = 1 if df_clean['Current'].iloc[0] > 0.01 else (-1 if df_clean['Current'].iloc[0] < -0.01 else 0)
+                
+                for i in range(1, len(df_clean)):
+                    current_sign = 1 if df_clean['Current'].iloc[i] > 0.01 else (-1 if df_clean['Current'].iloc[i] < -0.01 else 0)
+                    if prev_sign != 0 and current_sign != 0 and current_sign != prev_sign:
+                        cycle_idx += 1
+                    cycle_indices.append(cycle_idx)
+                    prev_sign = current_sign
+                
+                df_clean['Cycle_Index'] = cycle_indices
+    
+    # Ensure Cycle_Index is integer
+    if 'Cycle_Index' in df_clean.columns:
+        df_clean['Cycle_Index'] = df_clean['Cycle_Index'].astype(int)
     
     return df_clean
 
@@ -820,18 +906,96 @@ def resample_to_uniform_voltage_axis(df: pd.DataFrame, voltage_points: int = 100
     return df_clean
 
 
-def smooth_for_derivatives(df: pd.DataFrame, window_length: int = 11, polyorder: int = 3) -> pd.DataFrame:
+def resample_to_uniform_frequency(df: pd.DataFrame, frequency_hz: float = 1.0) -> pd.DataFrame:
     """
-    Apply Savitzky-Golay filter for smoothing before derivative calculation.
+    Resample time-series data to uniform frequency (Issue 3 Fix).
+    Essential for ICA/dQ/dV analysis which requires uniform sampling.
+    
+    Parameters:
+    -----------
+    df : pd.DataFrame
+        Input dataframe with Time column
+    frequency_hz : float
+        Target sampling frequency in Hz (default: 1.0 Hz = 1 sample per second)
+    
+    Returns:
+    --------
+    pd.DataFrame
+        Resampled dataframe with uniform time spacing
+    """
+    if 'Time' not in df.columns:
+        return df
+    
+    df_clean = df.copy()
+    df_clean = df_clean.sort_values('Time').reset_index(drop=True)
+    
+    # Create uniform time grid
+    time_min = df_clean['Time'].min()
+    time_max = df_clean['Time'].max()
+    dt = 1.0 / frequency_hz  # Time step in seconds
+    uniform_time = np.arange(time_min, time_max + dt, dt)
+    
+    # Interpolate all numeric columns
+    numeric_cols = df_clean.select_dtypes(include=[np.number]).columns.tolist()
+    if 'Time' in numeric_cols:
+        numeric_cols.remove('Time')
+    
+    resampled_data = {'Time': uniform_time}
+    
+    for col in numeric_cols:
+        if SCIPY_AVAILABLE:
+            try:
+                f_interp = interp1d(
+                    df_clean['Time'].values,
+                    df_clean[col].values,
+                    kind='linear',
+                    bounds_error=False,
+                    fill_value='extrapolate'
+                )
+                resampled_data[col] = f_interp(uniform_time)
+            except:
+                resampled_data[col] = np.interp(
+                    uniform_time,
+                    df_clean['Time'].values,
+                    df_clean[col].values
+                )
+        else:
+            resampled_data[col] = np.interp(
+                uniform_time,
+                df_clean['Time'].values,
+                df_clean[col].values
+            )
+    
+    # Preserve non-numeric columns by forward-filling
+    non_numeric_cols = df_clean.select_dtypes(exclude=[np.number]).columns.tolist()
+    if non_numeric_cols:
+        df_resampled = pd.DataFrame(resampled_data)
+        # For non-numeric columns, use nearest neighbor interpolation
+        for col in non_numeric_cols:
+            if col in df_clean.columns:
+                indices = np.searchsorted(df_clean['Time'].values, uniform_time, side='left')
+                indices = np.clip(indices, 0, len(df_clean) - 1)
+                df_resampled[col] = df_clean[col].iloc[indices].values
+        return df_resampled
+    
+    return pd.DataFrame(resampled_data)
+
+
+def smooth_for_derivatives(df: pd.DataFrame, window_length: int = 51, polyorder: int = 3, apply_to_original: bool = True) -> pd.DataFrame:
+    """
+    Apply Savitzky-Golay filter for smoothing and spike removal (Issue 4 Fix).
+    By default, applies smoothing directly to Voltage and Current columns to remove noise.
     
     Parameters:
     -----------
     df : pd.DataFrame
         Input dataframe
     window_length : int
-        Window length for Savitzky-Golay filter (must be odd)
+        Window length for Savitzky-Golay filter (must be odd). Default 51 for better noise removal.
     polyorder : int
-        Polynomial order
+        Polynomial order. Default 3.
+    apply_to_original : bool
+        If True, smooths the original Voltage/Current columns. If False, creates _Smoothed columns.
     
     Returns:
     --------
@@ -847,37 +1011,174 @@ def smooth_for_derivatives(df: pd.DataFrame, window_length: int = 11, polyorder:
     if window_length % 2 == 0:
         window_length += 1
     
-    # Smooth voltage and capacity for dQ/dV analysis
+    # Minimum window size check
+    min_window = max(5, polyorder + 2)
+    if window_length < min_window:
+        window_length = min_window
+        if window_length % 2 == 0:
+            window_length += 1
+    
+    # Smooth voltage and current to remove spikes (Issue 4)
     if 'Voltage' in df_clean.columns and len(df_clean) >= window_length:
         try:
-            df_clean['Voltage_Smoothed'] = savgol_filter(
+            voltage_smoothed = savgol_filter(
                 df_clean['Voltage'].ffill().bfill().values,
                 window_length,
                 polyorder
             )
-        except:
-            df_clean['Voltage_Smoothed'] = df_clean['Voltage']
+            if apply_to_original:
+                df_clean['Voltage'] = voltage_smoothed
+            else:
+                df_clean['Voltage_Smoothed'] = voltage_smoothed
+        except Exception as e:
+            if not apply_to_original:
+                df_clean['Voltage_Smoothed'] = df_clean['Voltage']
+    
+    if 'Current' in df_clean.columns and len(df_clean) >= window_length:
+        try:
+            current_smoothed = savgol_filter(
+                df_clean['Current'].ffill().bfill().values,
+                window_length,
+                polyorder
+            )
+            if apply_to_original:
+                df_clean['Current'] = current_smoothed
+            else:
+                df_clean['Current_Smoothed'] = current_smoothed
+        except Exception as e:
+            if not apply_to_original:
+                df_clean['Current_Smoothed'] = df_clean['Current']
     
     if 'Capacity' in df_clean.columns and len(df_clean) >= window_length:
         try:
-            df_clean['Capacity_Smoothed'] = savgol_filter(
+            capacity_smoothed = savgol_filter(
                 df_clean['Capacity'].ffill().bfill().values,
                 window_length,
                 polyorder
             )
-        except:
-            df_clean['Capacity_Smoothed'] = df_clean['Capacity']
+            if apply_to_original:
+                df_clean['Capacity'] = capacity_smoothed
+            else:
+                df_clean['Capacity_Smoothed'] = capacity_smoothed
+        except Exception as e:
+            if not apply_to_original:
+                df_clean['Capacity_Smoothed'] = df_clean['Capacity']
     
     return df_clean
+
+
+# ============================================================================
+# Metadata Extraction (Issue 5 Fix)
+# ============================================================================
+
+def extract_excel_metadata(file_path_or_buffer, sheet_name: str = None) -> dict:
+    """
+    Extract metadata from Excel file headers (Issue 5 Fix).
+    Extracts test report name, channel number, schedule file, operator, notes.
+    
+    Parameters:
+    -----------
+    file_path_or_buffer
+        Excel file path or file-like object
+    sheet_name : str, optional
+        Specific sheet name to extract metadata from
+    
+    Returns:
+    --------
+    dict
+        Dictionary with extracted metadata
+    """
+    metadata = {
+        'test_report': None,
+        'channel': None,
+        'schedule_file': None,
+        'operator': None,
+        'notes': None,
+        'format': None,
+        'cycler': None
+    }
+    
+    try:
+        import openpyxl
+        
+        if hasattr(file_path_or_buffer, 'read'):
+            # File-like object
+            wb = openpyxl.load_workbook(file_path_or_buffer, read_only=True, data_only=True)
+        else:
+            # File path
+            wb = openpyxl.load_workbook(file_path_or_buffer, read_only=True, data_only=True)
+        
+        # Use specified sheet or first sheet
+        if sheet_name and sheet_name in wb.sheetnames:
+            ws = wb[sheet_name]
+        else:
+            ws = wb.active
+        
+        # Read first few rows to find metadata
+        for row_idx in range(1, min(20, ws.max_row + 1)):
+            row_values = [cell.value for cell in ws[row_idx]]
+            row_text = ' '.join([str(v) for v in row_values if v is not None]).lower()
+            
+            # Look for metadata patterns
+            for i, cell in enumerate(ws[row_idx]):
+                if cell.value is None:
+                    continue
+                
+                cell_text = str(cell.value).lower()
+                
+                # Test report
+                if 'test report' in cell_text or 'report name' in cell_text:
+                    if i + 1 < len(row_values) and row_values[i + 1]:
+                        metadata['test_report'] = str(row_values[i + 1])
+                
+                # Channel
+                if 'channel' in cell_text:
+                    if i + 1 < len(row_values) and row_values[i + 1]:
+                        metadata['channel'] = str(row_values[i + 1])
+                
+                # Schedule file
+                if 'schedule' in cell_text and 'file' in cell_text:
+                    if i + 1 < len(row_values) and row_values[i + 1]:
+                        metadata['schedule_file'] = str(row_values[i + 1])
+                
+                # Operator
+                if 'operator' in cell_text:
+                    if i + 1 < len(row_values) and row_values[i + 1]:
+                        metadata['operator'] = str(row_values[i + 1])
+                
+                # Notes
+                if 'note' in cell_text or 'comment' in cell_text:
+                    if i + 1 < len(row_values) and row_values[i + 1]:
+                        metadata['notes'] = str(row_values[i + 1])
+                
+                # Format/Cycler detection
+                if 'calce' in cell_text:
+                    metadata['format'] = 'calce'
+                    metadata['cycler'] = 'CALCE'
+                elif 'arbin' in cell_text:
+                    metadata['format'] = 'arbin'
+                    metadata['cycler'] = 'Arbin'
+                elif 'biologic' in cell_text:
+                    metadata['format'] = 'biologic'
+                    metadata['cycler'] = 'Biologic'
+        
+        wb.close()
+        
+    except Exception as e:
+        # If extraction fails, return empty metadata
+        pass
+    
+    return metadata
 
 
 # ============================================================================
 # Main Cleaning Pipeline
 # ============================================================================
 
-def clean_dataframe(df: pd.DataFrame, options: dict) -> pd.DataFrame:
+def clean_dataframe(df: pd.DataFrame, options: dict, metadata: dict = None) -> pd.DataFrame:
     """
     Comprehensive battery data cleaning pipeline implementing 3-phase approach.
+    Universal Cleaning Module v1.1 - Handles CALCE, Severson .mat, and generic formats.
     
     Phase 1: Data Ingestion and Harmonization
     Phase 2: Anomaly Detection and Correction
@@ -902,13 +1203,17 @@ def clean_dataframe(df: pd.DataFrame, options: dict) -> pd.DataFrame:
         - impute_missing: bool (default: True)
         - imputation_method: str ('linear', 'cubic', 'forward_fill', default: 'linear')
         - verify_electrochemical: bool (default: True)
+        - resample_uniform_frequency: bool (default: True) - NEW: Resample to 1 Hz
+        - frequency_hz: float (default: 1.0) - NEW: Target sampling frequency
         - resample_capacity_axis: bool (default: False)
         - capacity_points: int (default: 1000)
         - resample_voltage_axis: bool (default: False)
         - voltage_points: int (default: 1000)
-        - smooth_for_derivatives: bool (default: False)
-        - savgol_window: int (default: 11)
+        - smooth_for_derivatives: bool (default: True) - NEW: Default enabled
+        - savgol_window: int (default: 51) - NEW: Larger default for better smoothing
         - savgol_polyorder: int (default: 3)
+    metadata : dict, optional
+        Metadata dictionary from Excel headers (test_report, channel, schedule_file, etc.)
     
     Returns:
     --------
@@ -920,7 +1225,7 @@ def clean_dataframe(df: pd.DataFrame, options: dict) -> pd.DataFrame:
     # Phase 1: Data Ingestion and Harmonization
     if options.get('harmonize_schema', True):
         detect_cycler = options.get('detect_cycler', True)
-        cycler_format = detect_cycler_format(df_clean) if detect_cycler else None
+        cycler_format = detect_cycler_format(df_clean, metadata) if detect_cycler else None
         df_clean = harmonize_to_standard_schema(df_clean, cycler_format)
     
     # Phase 2: Anomaly Detection and Correction
@@ -962,13 +1267,27 @@ def clean_dataframe(df: pd.DataFrame, options: dict) -> pd.DataFrame:
         voltage_points = options.get('voltage_points', 1000)
         df_clean = resample_to_uniform_voltage_axis(df_clean, voltage_points)
     
-    if options.get('smooth_for_derivatives', False):
-        window_length = options.get('savgol_window', 11)
+    # Apply default Savitzky-Golay smoothing for spike removal (Issue 4 Fix)
+    # This is now enabled by default for better noise removal
+    if options.get('smooth_for_derivatives', True):  # Default True now
+        window_length = options.get('savgol_window', 51)  # Larger default window
         polyorder = options.get('savgol_polyorder', 3)
-        df_clean = smooth_for_derivatives(df_clean, window_length, polyorder)
+        apply_to_original = options.get('savgol_apply_to_original', True)
+        df_clean = smooth_for_derivatives(df_clean, window_length, polyorder, apply_to_original)
+    
+    # Resample to uniform frequency (Issue 3 Fix) - Essential for ICA/dQ/dV
+    if options.get('resample_uniform_frequency', True):  # Default True now
+        frequency_hz = options.get('frequency_hz', 1.0)  # Default 1 Hz
+        df_clean = resample_to_uniform_frequency(df_clean, frequency_hz)
     
     # Apply range filters (replace out-of-range values with 0)
     df_clean = apply_range_filters(df_clean, options)
+    
+    # Preserve metadata as attributes (Issue 5 Fix)
+    if metadata:
+        for key, value in metadata.items():
+            if value is not None:
+                df_clean.attrs[f'metadata_{key}'] = value
     
     return df_clean
 

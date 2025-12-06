@@ -3138,6 +3138,9 @@ with tab3:
                 selected_sheets = []
                 sheets_data = {}
                 
+                # Initialize metadata
+                metadata = {}
+                
                 if file_extension == 'csv':
                     df_original = pd.read_csv(uploaded_file)
                     st.session_state.file_type = 'csv'
@@ -3145,6 +3148,14 @@ with tab3:
                     try:
                         # Try importing openpyxl first
                         import openpyxl
+                        from cleaning_module import extract_excel_metadata
+                        
+                        # Extract metadata from Excel file (Issue 5 Fix)
+                        uploaded_file.seek(0)  # Reset file pointer
+                        metadata = extract_excel_metadata(uploaded_file)
+                        st.session_state.file_metadata = metadata  # Store in session state
+                        uploaded_file.seek(0)  # Reset again for reading
+                        
                         # Check if Excel file has multiple sheets
                         all_sheets = get_excel_sheets(uploaded_file)
                         channel_sheets = filter_channel_sheets(all_sheets)
@@ -3379,12 +3390,20 @@ with tab3:
                         voltage_points = st.number_input("Voltage grid points", min_value=100, value=1000, step=100)
                 
                 with col_phase3_2:
-                    smooth_for_derivatives = st.checkbox("Smooth for derivative calculation (Savitzky-Golay)", value=False)
-                    savgol_window = 11
+                    resample_uniform_frequency = st.checkbox("Resample to uniform frequency (1 Hz)", value=True,
+                                                             help="Essential for ICA/dQ/dV analysis. Resamples data to uniform time spacing.")
+                    frequency_hz = 1.0
+                    if resample_uniform_frequency:
+                        frequency_hz = st.number_input("Sampling frequency (Hz)", min_value=0.1, value=1.0, step=0.1,
+                                                       help="Target sampling frequency. Default 1 Hz = 1 sample per second.")
+                    
+                    smooth_for_derivatives = st.checkbox("Smooth for derivative calculation (Savitzky-Golay)", value=True,
+                                                        help="Removes spikes and noise. Enabled by default for better data quality.")
+                    savgol_window = 51
                     savgol_polyorder = 3
                     if smooth_for_derivatives:
-                        savgol_window = st.number_input("Savitzky-Golay window", min_value=5, value=11, step=2, 
-                                                       help="Must be odd number")
+                        savgol_window = st.number_input("Savitzky-Golay window", min_value=5, value=51, step=2, 
+                                                       help="Must be odd number. Larger window = more smoothing (default: 51)")
                         savgol_polyorder = st.number_input("Polynomial order", min_value=1, max_value=5, value=3)
                 
                 # Range filtering options - initialize defaults
@@ -3517,6 +3536,11 @@ with tab3:
                         # Use stored dataframe if available, otherwise use current
                         df_to_clean = st.session_state.get('df_original', df_original)
                         
+                        # Get metadata if available (stored in session state or local variable)
+                        file_metadata = st.session_state.get('file_metadata', {})
+                        if not file_metadata and 'metadata' in locals():
+                            file_metadata = metadata
+                        
                         cleaning_options = {
                             # Basic options
                             'remove_duplicates': remove_duplicates,
@@ -3548,6 +3572,8 @@ with tab3:
                             'imputation_method': imputation_method,
                             'verify_electrochemical': verify_electrochemical,
                             # Phase 3: Preprocessing for Feature Extraction
+                            'resample_uniform_frequency': resample_uniform_frequency,
+                            'frequency_hz': frequency_hz,
                             'resample_capacity_axis': resample_capacity_axis,
                             'capacity_points': capacity_points,
                             'resample_voltage_axis': resample_voltage_axis,
@@ -3555,12 +3581,16 @@ with tab3:
                             'smooth_for_derivatives': smooth_for_derivatives,
                             'savgol_window': savgol_window,
                             'savgol_polyorder': savgol_polyorder,
+                            'savgol_apply_to_original': True,  # Apply smoothing to original columns
                             # Range filtering
                             'apply_range_filters': apply_range_filters,
                             'range_filters': range_filters
                         }
                         
-                        df_cleaned = clean_dataframe(df_to_clean, cleaning_options)
+                        # Get metadata if available
+                        file_metadata = metadata if 'metadata' in locals() else {}
+                        
+                        df_cleaned = clean_dataframe(df_to_clean, cleaning_options, metadata=file_metadata)
                         
                         # Store in session state for download
                         st.session_state.cleaned_df = df_cleaned

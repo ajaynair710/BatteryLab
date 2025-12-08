@@ -301,14 +301,23 @@ def harmonize_to_standard_schema(df: pd.DataFrame, cycler_format: str = None) ->
         if 'Time' in df_clean.columns:
             df_clean = normalize_time_to_seconds(df_clean)
         
-        # Ensure datetime column exists
-        if 'DateTime' not in df_clean.columns:
+        # v1.2 Fix #3: Use Date_Time if available, don't create synthetic DateTime
+        if 'Date_Time' in df_clean.columns:
+            # Parse Date_Time as canonical timestamp
+            df_clean['DateTime'] = pd.to_datetime(df_clean['Date_Time'], errors='coerce')
+        elif 'DateTime' not in df_clean.columns:
             if 'Time' in df_clean.columns:
-                # Try to create DateTime from Time (assuming relative to test start)
+                # Only create synthetic DateTime if no Date_Time exists
+                # Use first sample's time as reference if available
                 test_start = pd.Timestamp.now() - pd.Timedelta(seconds=df_clean['Time'].max())
                 df_clean['DateTime'] = test_start + pd.to_timedelta(df_clean['Time'], unit='s')
             else:
                 df_clean['DateTime'] = pd.Timestamp.now()
+    
+    # v1.2 Fix #3: If both Date_Time and DateTime exist, prefer Date_Time
+    if 'Date_Time' in df_clean.columns and 'DateTime' in df_clean.columns:
+        # Overwrite DateTime with parsed Date_Time
+        df_clean['DateTime'] = pd.to_datetime(df_clean['Date_Time'], errors='coerce')
     
     return df_clean
 
@@ -908,8 +917,13 @@ def resample_to_uniform_voltage_axis(df: pd.DataFrame, voltage_points: int = 100
 
 def resample_to_uniform_frequency(df: pd.DataFrame, frequency_hz: float = 1.0) -> pd.DataFrame:
     """
-    Resample time-series data to uniform frequency (Issue 3 Fix).
+    Resample time-series data to uniform frequency (Issue 3 Fix, v1.2 Bug Fix).
     Essential for ICA/dQ/dV analysis which requires uniform sampling.
+    
+    FIXES in v1.2:
+    - Cycle_Index, Step_Index, Data_Point are NOT interpolated (categorical/discrete)
+    - Only continuous physical signals are interpolated (Current, Voltage, Capacity, etc.)
+    - Categorical columns use forward-fill or nearest neighbor
     
     Parameters:
     -----------
@@ -929,20 +943,54 @@ def resample_to_uniform_frequency(df: pd.DataFrame, frequency_hz: float = 1.0) -
     df_clean = df.copy()
     df_clean = df_clean.sort_values('Time').reset_index(drop=True)
     
+    # Columns to EXCLUDE from interpolation (categorical/discrete) - v1.2 Fix
+    exclude_from_interpolation = [
+        'Cycle_Index', 'Step_Index', 'Data_Point', 'Step_Time', 'Step_Time(s)',
+        'Is_RPT', 'Is_FC_Data', 'Anomaly_Flag', 'Missing_Data_Flag',
+        'CE_Anomaly', 'Capacity_Drift_Anomaly', 'Step_Type'
+    ]
+    
+    # Also exclude any column with "flag", "index", "point" in name (case-insensitive)
+    exclude_patterns = ['flag', 'index', 'point', 'type', 'id', 'source']
+    for col in df_clean.columns:
+        col_lower = col.lower()
+        if any(pattern in col_lower for pattern in exclude_patterns):
+            if col not in exclude_from_interpolation:
+                exclude_from_interpolation.append(col)
+    
+    # Columns to interpolate (continuous physical signals)
+    numeric_cols = df_clean.select_dtypes(include=[np.number]).columns.tolist()
+    
+    # Remove Time and excluded columns
+    if 'Time' in numeric_cols:
+        numeric_cols.remove('Time')
+    
+    # Only interpolate truly continuous physical signals
+    physical_signals = ['Current', 'Voltage', 'Capacity', 'Temperature', 
+                       'Internal_Resistance', 'IR', 'Power', 'Energy', 
+                       'SOC', 'SOH', 'Charge_Capacity', 'Discharge_Capacity']
+    
+    cols_to_interpolate = []
+    for col in numeric_cols:
+        if col not in exclude_from_interpolation:
+            # Include if it's a known physical signal or doesn't match exclusion patterns
+            col_lower = col.lower()
+            if any(signal.lower() in col_lower for signal in physical_signals):
+                cols_to_interpolate.append(col)
+            elif not any(pattern in col_lower for pattern in exclude_patterns):
+                # Safe to interpolate if not explicitly excluded
+                cols_to_interpolate.append(col)
+    
     # Create uniform time grid
     time_min = df_clean['Time'].min()
     time_max = df_clean['Time'].max()
     dt = 1.0 / frequency_hz  # Time step in seconds
     uniform_time = np.arange(time_min, time_max + dt, dt)
     
-    # Interpolate all numeric columns
-    numeric_cols = df_clean.select_dtypes(include=[np.number]).columns.tolist()
-    if 'Time' in numeric_cols:
-        numeric_cols.remove('Time')
-    
     resampled_data = {'Time': uniform_time}
     
-    for col in numeric_cols:
+    # Interpolate continuous physical signals
+    for col in cols_to_interpolate:
         if SCIPY_AVAILABLE:
             try:
                 f_interp = interp1d(
@@ -966,19 +1014,82 @@ def resample_to_uniform_frequency(df: pd.DataFrame, frequency_hz: float = 1.0) -
                 df_clean[col].values
             )
     
-    # Preserve non-numeric columns by forward-filling
-    non_numeric_cols = df_clean.select_dtypes(exclude=[np.number]).columns.tolist()
-    if non_numeric_cols:
-        df_resampled = pd.DataFrame(resampled_data)
-        # For non-numeric columns, use nearest neighbor interpolation
-        for col in non_numeric_cols:
-            if col in df_clean.columns:
-                indices = np.searchsorted(df_clean['Time'].values, uniform_time, side='left')
-                indices = np.clip(indices, 0, len(df_clean) - 1)
-                df_resampled[col] = df_clean[col].iloc[indices].values
-        return df_resampled
+    # Handle categorical/discrete columns with forward-fill or nearest neighbor
+    # EXCLUDE Cycle_Index, Step_Index, Data_Point from nearest neighbor - they need special handling
+    special_categorical_cols = ['Cycle_Index', 'Step_Index', 'Data_Point']
+    categorical_cols = [col for col in df_clean.columns 
+                       if col not in cols_to_interpolate and col != 'Time' 
+                       and col not in special_categorical_cols]
     
-    return pd.DataFrame(resampled_data)
+    df_resampled = pd.DataFrame(resampled_data)
+    
+    # For regular categorical columns, use nearest neighbor (forward-fill approach)
+    for col in categorical_cols:
+        if col in df_clean.columns:
+            # Find nearest original sample for each resampled point
+            indices = np.searchsorted(df_clean['Time'].values, uniform_time, side='left')
+            indices = np.clip(indices, 0, len(df_clean) - 1)
+            df_resampled[col] = df_clean[col].iloc[indices].values
+    
+    # CRITICAL FIX: Set Cycle_Index once per cycle (v1.2 Bug Fix #1)
+    # Don't use nearest neighbor - assign based on time boundaries
+    if 'Cycle_Index' in df_clean.columns:
+        # Get unique cycles from original data, ensure they're integers
+        unique_cycles_raw = df_clean['Cycle_Index'].dropna().unique()
+        # Convert to integers (handle any fractional values)
+        unique_cycles = sorted([int(round(cyc)) for cyc in unique_cycles_raw])
+        
+        # Initialize Cycle_Index column in resampled data
+        df_resampled['Cycle_Index'] = 0  # Initialize with 0
+        
+        # Map resampled points to original cycles based on time boundaries
+        for cycle_id in unique_cycles:
+            # Find all original rows with this cycle (handle fractional matches)
+            cycle_mask = (df_clean['Cycle_Index'] >= cycle_id - 0.5) & (df_clean['Cycle_Index'] < cycle_id + 0.5)
+            if cycle_mask.any():
+                cycle_time_min = df_clean.loc[cycle_mask, 'Time'].min()
+                cycle_time_max = df_clean.loc[cycle_mask, 'Time'].max()
+                # Assign cycle to resampled points in this time range
+                cycle_mask_resampled = (df_resampled['Time'] >= cycle_time_min) & (df_resampled['Time'] <= cycle_time_max)
+                df_resampled.loc[cycle_mask_resampled, 'Cycle_Index'] = cycle_id
+        
+        # Ensure Cycle_Index is integer
+        df_resampled['Cycle_Index'] = df_resampled['Cycle_Index'].astype(int)
+    
+    # Handle Step_Index and Data_Point similarly (v1.2 Bug Fix #2)
+    # Step_Index: Use forward-fill within each cycle
+    if 'Step_Index' in df_clean.columns:
+        df_resampled['Step_Index'] = 0  # Initialize
+        if 'Cycle_Index' in df_resampled.columns:
+            for cycle_id in df_resampled['Cycle_Index'].unique():
+                cycle_mask_resampled = df_resampled['Cycle_Index'] == cycle_id
+                cycle_mask_original = (df_clean['Cycle_Index'] >= cycle_id - 0.5) & (df_clean['Cycle_Index'] < cycle_id + 0.5)
+                if cycle_mask_original.any():
+                    # Use nearest neighbor for Step_Index within cycle
+                    cycle_times = df_resampled.loc[cycle_mask_resampled, 'Time'].values
+                    original_times = df_clean.loc[cycle_mask_original, 'Time'].values
+                    original_steps = df_clean.loc[cycle_mask_original, 'Step_Index'].values
+                    indices = np.searchsorted(original_times, cycle_times, side='left')
+                    indices = np.clip(indices, 0, len(original_times) - 1)
+                    df_resampled.loc[cycle_mask_resampled, 'Step_Index'] = original_steps[indices]
+            # Ensure Step_Index is integer
+            df_resampled['Step_Index'] = df_resampled['Step_Index'].astype(int)
+    
+    # Data_Point: Not meaningful on resampled grid, but preserve if needed
+    if 'Data_Point' in df_clean.columns:
+        # Data_Point is just an index - not meaningful after resampling
+        # We could drop it or set to NaN, but for compatibility, use nearest neighbor
+        indices = np.searchsorted(df_clean['Time'].values, uniform_time, side='left')
+        indices = np.clip(indices, 0, len(df_clean) - 1)
+        df_resampled['Data_Point'] = df_clean['Data_Point'].iloc[indices].values
+    
+    # Add per-cycle relative time (t_cycle) - v1.2 Feature #4
+    if 'Cycle_Index' in df_resampled.columns:
+        df_resampled['t_cycle'] = df_resampled.groupby('Cycle_Index')['Time'].transform(
+            lambda s: s - s.min()
+        )
+    
+    return df_resampled
 
 
 def smooth_for_derivatives(df: pd.DataFrame, window_length: int = 51, polyorder: int = 3, apply_to_original: bool = True) -> pd.DataFrame:
@@ -1063,6 +1174,59 @@ def smooth_for_derivatives(df: pd.DataFrame, window_length: int = 51, polyorder:
         except Exception as e:
             if not apply_to_original:
                 df_clean['Capacity_Smoothed'] = df_clean['Capacity']
+    
+    return df_clean
+
+
+# ============================================================================
+# Canonical Naming (v1.2 Feature #5)
+# ============================================================================
+
+def apply_canonical_naming(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Apply canonical column naming for universal analytics.
+    Standardizes to: I, V, Test_Time, t_cycle, Step_Time, DateTime
+    
+    Parameters:
+    -----------
+    df : pd.DataFrame
+        Input dataframe
+    
+    Returns:
+    --------
+    pd.DataFrame
+        Dataframe with canonical column names
+    """
+    df_clean = df.copy()
+    rename_map = {}
+    
+    # Map to canonical names
+    cols_l = {col.lower(): col for col in df_clean.columns}
+    
+    # Current -> I
+    if 'current' in cols_l and 'I' not in df_clean.columns:
+        rename_map[cols_l['current']] = 'I'
+    
+    # Voltage -> V
+    if 'voltage' in cols_l and 'V' not in df_clean.columns:
+        rename_map[cols_l['voltage']] = 'V'
+    
+    # Time -> Test_Time (if t_cycle exists, rename Time to Test_Time)
+    if 'time' in cols_l and 'test_time' not in [c.lower() for c in df_clean.columns]:
+        if 't_cycle' in df_clean.columns:
+            rename_map[cols_l['time']] = 'Test_Time'
+        else:
+            # If no t_cycle, rename Time to Test_Time
+            rename_map[cols_l['time']] = 'Test_Time'
+    
+    # Step_Time(s) -> Step_Time
+    for col in df_clean.columns:
+        if col.lower() in ['step_time(s)', 'step_time_s']:
+            rename_map[col] = 'Step_Time'
+    
+    # Apply renames
+    if rename_map:
+        df_clean = df_clean.rename(columns=rename_map)
     
     return df_clean
 
@@ -1282,6 +1446,9 @@ def clean_dataframe(df: pd.DataFrame, options: dict, metadata: dict = None) -> p
     
     # Apply range filters (replace out-of-range values with 0)
     df_clean = apply_range_filters(df_clean, options)
+    
+    # v1.2 Feature #5: Canonical naming for universal analytics
+    df_clean = apply_canonical_naming(df_clean)
     
     # Preserve metadata as attributes (Issue 5 Fix)
     if metadata:

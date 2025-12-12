@@ -1266,7 +1266,21 @@ with tab2:
 
         up = st.file_uploader("Upload CSV or MAT file", type=["csv", "mat"])
         if up is not None:
-            with st.spinner("Parsing and extracting features..."):
+            # Check file size before processing
+            file_size_mb = len(up.getvalue()) / (1024 * 1024)
+            
+            # Show warnings based on file size, but allow loading
+            if file_size_mb > 100:
+                st.warning(f"⚠️ Very large file detected ({file_size_mb:.1f} MB). Loading will take longer and use significant memory.")
+                st.info("**Performance Tips:**\n"
+                        "- Loading may take several minutes\n"
+                        "- Memory-efficient mode is automatically enabled\n"
+                        "- Consider exporting to CSV format for faster loading\n"
+                        "- Close other applications to free up memory")
+            elif file_size_mb > 30:
+                st.warning(f"⚠️ Large file detected ({file_size_mb:.1f} MB). Loading may take longer and use significant memory.")
+            
+            with st.spinner(f"Parsing and extracting features... ({file_size_mb:.1f} MB)"):
                 df = None
                 name = up.name.lower()
                 if name.endswith(".csv"):
@@ -1280,22 +1294,72 @@ with tab2:
                         try:
                             # First try with struct_as_record=True (default) to handle structures as dicts
                             mat = loadmat(io.BytesIO(up.getvalue()), struct_as_record=True, squeeze_me=True)
-                        except:
+                        except MemoryError:
+                            st.error(f"❌ Out of memory while loading MAT file ({file_size_mb:.1f} MB)")
+                            st.info("**Solutions:**\n"
+                                    "- Export your data to CSV format (more memory-efficient)\n"
+                                    "- Reduce the file size by downsampling\n"
+                                    "- Close other applications to free up memory\n"
+                                    "- Use a machine with more RAM")
+                            st.stop()
+                        except Exception as e:
                             try:
                                 # Fallback to False
                                 mat = loadmat(io.BytesIO(up.getvalue()), struct_as_record=False, squeeze_me=True)
-                            except Exception as e:
-                                st.error(f"Error loading .mat file: {str(e)}")
+                            except MemoryError:
+                                st.error(f"❌ Out of memory while loading MAT file ({file_size_mb:.1f} MB)")
+                                st.info("**Solutions:**\n"
+                                        "- Export your data to CSV format (more memory-efficient)\n"
+                                        "- Reduce the file size by downsampling\n"
+                                        "- Close other applications to free up memory\n"
+                                        "- Use a machine with more RAM")
+                                st.stop()
+                            except Exception as e2:
+                                st.error(f"❌ Error loading .mat file: {str(e2)}")
+                                st.info("**Troubleshooting:**\n"
+                                        "- Verify the file is a valid MATLAB .mat file\n"
+                                        "- Try exporting to CSV format instead\n"
+                                        "- Check if the file is corrupted")
                                 st.stop()
                         
+                        
+                        
                         # Helper function to extract data from MATLAB structures
-                        def extract_from_struct(obj, path="", depth=0):
-                            """Recursively extract arrays from MATLAB structures"""
+                        # Adjust limits based on file size - more aggressive for very large files
+                        if file_size_mb > 100:
+                            max_depth = 4  # Very conservative for huge files
+                            max_arrays = 300  # Strict limit
+                            max_array_size = 5_000_000  # Skip arrays with more than 5M elements
+                        elif file_size_mb > 30:
+                            max_depth = 6  # Reduce depth for large files
+                            max_arrays = 500  # Limit total arrays extracted
+                            max_array_size = 10_000_000  # Skip arrays with more than 10M elements
+                        else:
+                            max_depth = 8  # Normal depth
+                            max_arrays = 1000  # More arrays allowed
+                            max_array_size = 10_000_000  # Skip arrays with more than 10M elements
+                        
+                        def extract_from_struct(obj, path="", depth=0, extracted_count=None):
+                            """Recursively extract arrays from MATLAB structures with memory limits"""
+                            if extracted_count is None:
+                                extracted_count = {'count': 0}
+                            
                             results = {}
-                            if depth > 10:  # Prevent infinite recursion
+                            
+                            # Prevent infinite recursion and limit depth for large files
+                            if depth > max_depth:
                                 return results
+                            
+                            # Early termination if too many arrays extracted
+                            if extracted_count['count'] >= max_arrays:
+                                return results
+                            
                             try:
                                 if isinstance(obj, np.ndarray):
+                                    # Skip extremely large arrays to prevent memory issues
+                                    if obj.size > max_array_size:
+                                        return results
+                                    
                                     if obj.dtype.names:  # Structured array (like MatlabOpaque)
                                         # First, try to extract from known MATLAB opaque fields
                                         for fname in ['arr', 's0', 's1', 's2']:
@@ -1303,13 +1367,14 @@ with tab2:
                                                 field_data = obj[fname]
                                                 if isinstance(field_data, np.ndarray):
                                                     if field_data.dtype == object and field_data.size > 0:
-                                                        # Object array - drill into each element
+                                                        # Object array - drill into each element (limit iterations)
                                                         for idx, item in enumerate(field_data.flat):
-                                                            if item is not None:
-                                                                results.update(extract_from_struct(item, f"{path}.{fname}_{idx}" if path else f"{fname}_{idx}", depth+1))
-                                                    elif field_data.size > 1 and field_data.dtype != object:
+                                                            if item is not None and idx < 100:  # Limit iterations
+                                                                results.update(extract_from_struct(item, f"{path}.{fname}_{idx}" if path else f"{fname}_{idx}", depth+1, extracted_count))
+                                                    elif field_data.size > 1 and field_data.dtype != object and field_data.size <= max_array_size:
                                                         # Numeric array
                                                         results[f"{path}.{fname}" if path else fname] = np.squeeze(field_data)
+                                                        extracted_count['count'] += 1
                                         
                                         # Also extract all other fields recursively
                                         for name in obj.dtype.names:
@@ -1318,37 +1383,40 @@ with tab2:
                                                 if isinstance(field_data, np.ndarray):
                                                     if field_data.dtype == object and field_data.size > 0:
                                                         for idx, item in enumerate(field_data.flat):
-                                                            if item is not None:
-                                                                results.update(extract_from_struct(item, f"{path}.{name}_{idx}" if path else f"{name}_{idx}", depth+1))
-                                                    elif field_data.size > 1 and field_data.dtype != object:
+                                                            if item is not None and idx < 100:  # Limit iterations
+                                                                results.update(extract_from_struct(item, f"{path}.{name}_{idx}" if path else f"{name}_{idx}", depth+1, extracted_count))
+                                                    elif field_data.size > 1 and field_data.dtype != object and field_data.size <= max_array_size:
                                                         results[f"{path}.{name}" if path else name] = np.squeeze(field_data)
+                                                        extracted_count['count'] += 1
                                     elif obj.dtype == object and obj.size > 0:
-                                        # Object array - extract each element
+                                        # Object array - extract each element (limit iterations)
                                         for idx, item in enumerate(obj.flat):
-                                            if item is not None:
-                                                results.update(extract_from_struct(item, f"{path}_{idx}" if path else f"item_{idx}", depth+1))
-                                    elif obj.size > 1 and obj.dtype != object:
+                                            if item is not None and idx < 100:  # Limit iterations
+                                                results.update(extract_from_struct(item, f"{path}_{idx}" if path else f"item_{idx}", depth+1, extracted_count))
+                                    elif obj.size > 1 and obj.dtype != object and obj.size <= max_array_size:
                                         # Regular numeric array
                                         if path:
                                             results[path] = np.squeeze(obj)
+                                            extracted_count['count'] += 1
                                 elif isinstance(obj, dict):
                                     for k, v in obj.items():
                                         if not k.startswith('__'):
                                             new_path = f"{path}.{k}" if path else k
-                                            results.update(extract_from_struct(v, new_path, depth+1))
+                                            results.update(extract_from_struct(v, new_path, depth+1, extracted_count))
                                 elif hasattr(obj, '_fieldnames'):  # MATLAB struct object
                                     for field in obj._fieldnames:
                                         field_data = getattr(obj, field, None)
                                         if field_data is not None:
                                             new_path = f"{path}.{field}" if path else field
-                                            results.update(extract_from_struct(field_data, new_path, depth+1))
+                                            results.update(extract_from_struct(field_data, new_path, depth+1, extracted_count))
                                 elif isinstance(obj, (list, tuple)):
                                     for idx, item in enumerate(obj):
-                                        if item is not None:
-                                            results.update(extract_from_struct(item, f"{path}_{idx}" if path else f"item_{idx}", depth+1))
+                                        if item is not None and idx < 100:  # Limit iterations
+                                            results.update(extract_from_struct(item, f"{path}_{idx}" if path else f"item_{idx}", depth+1, extracted_count))
                             except Exception as e:
                                 pass
                             return results
+                        
                         
                         # Get all keys (including metadata for debugging)
                         all_keys = list(mat.keys())
@@ -1356,9 +1424,11 @@ with tab2:
                         
                         # Extract all data from structures, including MatlabOpaque
                         extracted_data = {}
+                        extraction_counter = {'count': 0}
+                        
                         for key in non_meta_keys:
                             if key in mat:
-                                extracted = extract_from_struct(mat[key], key)
+                                extracted = extract_from_struct(mat[key], key, extracted_count=extraction_counter)
                                 # Fix keys that start with "None" - replace with actual key name
                                 fixed_extracted = {}
                                 for ek, ev in extracted.items():
@@ -1369,6 +1439,14 @@ with tab2:
                                     else:
                                         fixed_extracted[ek] = ev
                                 extracted_data.update(fixed_extracted)
+                        
+                        
+                        # Show extraction progress
+                        if extraction_counter['count'] > 0:
+                            st.info(f"✓ Extracted {extraction_counter['count']} arrays from MAT file structure")
+                            if extraction_counter['count'] >= max_arrays:
+                                st.warning(f"⚠️ Extraction limited to {max_arrays} arrays due to file size. Some data may not be loaded.")
+                        
                         # Iterate over a static snapshot to avoid modifying the dict during iteration
                         for key, value in list(extracted_data.items()):
                             if isinstance(value, np.ndarray) and value.size > 1:

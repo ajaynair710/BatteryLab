@@ -31,6 +31,7 @@ import matplotlib.pyplot as plt
 try:
     from scipy.signal import savgol_filter, find_peaks, peak_widths
     from scipy.io import loadmat, savemat
+    import h5py
     SCIPY_OK = True
 except Exception:
     SCIPY_OK = False
@@ -71,6 +72,12 @@ if "cleaning_applied" not in st.session_state:
 # =========================
 # Helpers (shared)
 # =========================
+def _downsample_series(df: pd.DataFrame, max_points: int = 5000) -> pd.DataFrame:
+    """Downsample a DataFrame to a maximum number of points while preserving shape."""
+    if len(df) <= max_points:
+        return df
+    return df.iloc[::len(df) // max_points].copy()
+
 def _standardize_columns(df: pd.DataFrame):
     cols_l = [c.lower() for c in df.columns]
     vcol = None
@@ -1269,6 +1276,75 @@ with tab2:
             # Check file size before processing
             file_size_mb = len(up.getvalue()) / (1024 * 1024)
             
+            # Configure memory limits based on file size
+            if file_size_mb > 100:
+                max_depth = 3
+                max_arrays = 500
+                max_array_size = 10_000_000  # Skip arrays with more than 10M elements
+            else:
+                max_depth = 8
+                max_arrays = 1000
+                max_array_size = 10_000_000
+
+            def _extract_from_hdf5(group, path="", depth=0, extracted_count=None):
+                """Recursively extract arrays from HDF5 group (MATLAB v7.3) with memory limits"""
+                if extracted_count is None:
+                    extracted_count = {'count': 0}
+                
+                results = {}
+                
+                # Prevent infinite recursion and limit depth
+                if depth > max_depth:
+                    return results
+                
+                # Early termination if too many arrays extracted
+                if extracted_count['count'] >= max_arrays:
+                    return results
+                    
+                try:
+                    # Iterate over items in the group
+                    for key, item in group.items():
+                        current_path = f"{path}.{key}" if path else key
+                        
+                        if isinstance(item, h5py.Dataset):
+                            # Check size before loading
+                            if item.size > max_array_size:
+                                continue
+                                
+                            # HDF5 in MATLAB is often transposed (column-major vs row-major)
+                            # We need to handle object references and basic types
+                            try:
+                                # Check for object references first
+                                if item.dtype.kind == 'O': 
+                                    pass
+                                else:
+                                    # Numeric data
+                                    val = item[()]
+                                    # Transpose to match MATLAB behavior (if it's 2D+)
+                                    if val.ndim >= 2:
+                                        val = val.T
+                                        
+                                    # Handle 1x1 arrays as scalars or squeezed
+                                    val = np.squeeze(val)
+                                    
+                                    # Only add if we have valid data
+                                    if val.size > 0:
+                                        results[current_path] = val
+                                        extracted_count['count'] += 1
+                            except:
+                                pass
+                        elif isinstance(item, h5py.Group):
+                            # Recursive call
+                            results.update(_extract_from_hdf5(item, current_path, depth+1, extracted_count))
+                            
+                            # Check limit after recursion
+                            if extracted_count['count'] >= max_arrays:
+                                return results
+                except Exception:
+                    pass
+                    
+                return results
+            
             # Show warnings based on file size, but allow loading
             if file_size_mb > 100:
                 st.warning(f"⚠️ Very large file detected ({file_size_mb:.1f} MB). Loading will take longer and use significant memory.")
@@ -1314,8 +1390,30 @@ with tab2:
                                         "- Close other applications to free up memory\n"
                                         "- Use a machine with more RAM")
                                 st.stop()
-                            except Exception as e2:
-                                st.error(f"❌ Error loading .mat file: {str(e2)}")
+                        except Exception as e2:
+                            # Try HDF5 (MATLAB v7.3)
+                            try:
+                                import h5py
+                                f_bytes = io.BytesIO(up.getvalue())
+                                mat = h5py.File(f_bytes, 'r')
+                                # Extract data using HDF5 walker
+                                st.info("ℹ️ Detected HDF5-based MAT file (v7.3). Using specialized loader.")
+                                
+                                # Simple wrapper to match expected structure
+                                # We'll extract everything into a flat dictionary, similar to how we process structs
+                                extracted_data = _extract_from_hdf5(mat)
+                                all_arrays = extracted_data
+                                mat_keys = list(extracted_data.keys())
+                                
+                                # Create a pseudo-mat dictionary for compatibility with downstream logic
+                                # This is a bit hacky but avoids rewriting the entire downstream processing
+                                mat = extracted_data
+                                
+                            except ImportError:
+                                st.error("❌ HDF5 support requires 'h5py'. Please install it.")
+                                st.stop()
+                            except Exception as e3:
+                                st.error(f"❌ Error loading .mat file: {str(e2)}\n\nAlso failed HDF5 load: {str(e3)}")
                                 st.info("**Troubleshooting:**\n"
                                         "- Verify the file is a valid MATLAB .mat file\n"
                                         "- Try exporting to CSV format instead\n"
@@ -1416,6 +1514,8 @@ with tab2:
                             except Exception as e:
                                 pass
                             return results
+                        
+
                         
                         
                         # Get all keys (including metadata for debugging)
@@ -2616,7 +2716,9 @@ with tab2:
                             if 'discharge_capacity' in cycle_data.columns:
                                 cap_data = cycle_data.dropna(subset=['cycle', 'discharge_capacity'])
                                 if len(cap_data) > 0:
-                                    cap_chart = alt.Chart(cap_data).mark_line(point={'size': 100}).encode(
+                                    # Downsample for plotting to avoid browser crash
+                                    plot_data = _downsample_series(cap_data, max_points=3000)
+                                    cap_chart = alt.Chart(plot_data).mark_line(point={'size': 100}).encode(
                                         x=alt.X("cycle:Q", title="Cycle Number"),
                                         y=alt.Y("discharge_capacity:Q", title="Discharge Capacity (Ah)"),
                                         tooltip=['cycle:Q', 'discharge_capacity:Q']
@@ -2632,7 +2734,8 @@ with tab2:
                             if 'internal_resistance' in cycle_data.columns and cycle_data['internal_resistance'].notna().any():
                                 ir_data = cycle_data.dropna(subset=['cycle', 'internal_resistance'])
                                 if len(ir_data) > 0:
-                                    ir_chart = alt.Chart(ir_data).mark_line(point={'size': 100}, color='#FF6B6B').encode(
+                                    plot_data = _downsample_series(ir_data, max_points=3000)
+                                    ir_chart = alt.Chart(plot_data).mark_line(point={'size': 100}, color='#FF6B6B').encode(
                                         x=alt.X("cycle:Q", title="Cycle Number"),
                                         y=alt.Y("internal_resistance:Q", title="Internal Resistance (Ohm)"),
                                         tooltip=['cycle:Q', 'internal_resistance:Q']
@@ -2649,7 +2752,8 @@ with tab2:
                             if 'temperature' in cycle_data.columns and cycle_data['temperature'].notna().any():
                                 temp_data = cycle_data.dropna(subset=['cycle', 'temperature'])
                                 if len(temp_data) > 0:
-                                    temp_chart = alt.Chart(temp_data).mark_line(point={'size': 100}, color='#FFA500').encode(
+                                    plot_data = _downsample_series(temp_data, max_points=3000)
+                                    temp_chart = alt.Chart(plot_data).mark_line(point={'size': 100}, color='#FFA500').encode(
                                         x=alt.X("cycle:Q", title="Cycle Number"),
                                         y=alt.Y("temperature:Q", title="Temperature (°C)"),
                                         tooltip=['cycle:Q', 'temperature:Q']
@@ -2728,7 +2832,9 @@ with tab2:
                                     
                                     if ts_charts:
                                         combined_ts = pd.concat(ts_charts, ignore_index=True)
-                                        ts_chart = alt.Chart(combined_ts).mark_line().encode(
+                                        # Downsample aggressively for time-series as they can be huge
+                                        plot_data = _downsample_series(combined_ts, max_points=5000)
+                                        ts_chart = alt.Chart(plot_data).mark_line().encode(
                                             x=alt.X("time:Q", title="Time (s)"),
                                             y=alt.Y("value:Q", title="Value"),
                                             color=alt.Color("metric:N", title="Metric"),
@@ -2780,7 +2886,8 @@ with tab2:
                                             ts_df = ts_df.dropna()
                                             if len(ts_df) > 0:
                                                 with cols_ts[0]:
-                                                    curr_chart = alt.Chart(ts_df).mark_line().encode(
+                                                    plot_data = _downsample_series(ts_df, max_points=2000)
+                                                    curr_chart = alt.Chart(plot_data).mark_line().encode(
                                                         x=alt.X("time:Q", title="Time (s)"),
                                                         y=alt.Y("current:Q", title="Current (A)")
                                                     ).properties(title=f"Cycle {cycle_num} - Current", width=300, height=200)
@@ -2796,7 +2903,8 @@ with tab2:
                                             ts_df = ts_df.dropna()
                                             if len(ts_df) > 0:
                                                 with cols_ts[1]:
-                                                    volt_chart = alt.Chart(ts_df).mark_line().encode(
+                                                    plot_data = _downsample_series(ts_df, max_points=2000)
+                                                    volt_chart = alt.Chart(plot_data).mark_line().encode(
                                                         x=alt.X("time:Q", title="Time (s)"),
                                                         y=alt.Y("voltage:Q", title="Voltage (V)")
                                                     ).properties(title=f"Cycle {cycle_num} - Voltage", width=300, height=200)
@@ -2817,7 +2925,8 @@ with tab2:
                                 if 'vc_all_cell11' in st.session_state:
                                     vc_data = st.session_state.vc_all_cell11
                                     if vc_data is not None and len(vc_data) > 0:
-                                        vc_chart = alt.Chart(vc_data).mark_line(point={'size': 50}).encode(
+                                        plot_data = _downsample_series(vc_data, max_points=5000)
+                                        vc_chart = alt.Chart(plot_data).mark_line(point={'size': 50}).encode(
                                             x=alt.X("Voltage:Q", title="Voltage (V)", scale=alt.Scale(nice=True)),
                                             y=alt.Y("Capacity_Ah:Q", title="Capacity (Ah)", scale=alt.Scale(nice=True)),
                                             color=alt.Color("Cycle:N", title="Cycle"),
@@ -2834,7 +2943,8 @@ with tab2:
                                 if 'ica_all_cell11' in st.session_state:
                                     ica_data = st.session_state.ica_all_cell11
                                     if ica_data is not None and len(ica_data) > 0:
-                                        ica_chart = alt.Chart(ica_data).mark_line(point={'size': 50}).encode(
+                                        plot_data = _downsample_series(ica_data, max_points=5000)
+                                        ica_chart = alt.Chart(plot_data).mark_line(point={'size': 50}).encode(
                                             x=alt.X("Voltage:Q", title="Voltage (V)", scale=alt.Scale(nice=True)),
                                             y=alt.Y("dQdV:Q", title="dQ/dV (Ah/V)", scale=alt.Scale(nice=True)),
                                             color=alt.Color("Cycle:N", title="Cycle"),
@@ -2991,9 +3101,13 @@ with tab2:
                             st.markdown("### Visualizations")
                             vc_all = pd.concat(vc_all_rows, ignore_index=True)
                             ica_all = pd.concat(ica_all_rows, ignore_index=True)
+                            
+                            # Downsample big datasets to prevent browser crash
+                            vc_plot = _downsample_series(vc_all, max_points=10000)
+                            ica_plot = _downsample_series(ica_all, max_points=10000)
 
                             vc_chart = (
-                                alt.Chart(vc_all)
+                                alt.Chart(vc_plot)
                                 .mark_line()
                                 .encode(
                                     x=alt.X("Voltage:Q", title="Voltage (V)"),
@@ -3004,7 +3118,7 @@ with tab2:
                             )
 
                             ica_chart = (
-                                alt.Chart(ica_all)
+                                alt.Chart(ica_plot)
                                 .mark_line()
                                 .encode(
                                     x=alt.X("Voltage:Q", title="Voltage (V)"),
@@ -3328,6 +3442,8 @@ with tab3:
                         st.info("**To fix this:**\n1. Make sure you're using the virtual environment Python\n2. Install with: `.venv\\Scripts\\python.exe -m pip install openpyxl`\n3. Or activate venv first: `.venv\\Scripts\\Activate.ps1` then `pip install openpyxl`")
                         st.stop()
                     except Exception as e:
+                        pass
+
                         st.error(f"Error reading Excel file: {str(e)}")
                         st.info("**Troubleshooting:**\n- Make sure the file is a valid Excel file (.xlsx or .xls)\n- Check if the file is corrupted\n- Try opening it in Excel first to verify it's valid")
                         st.stop()

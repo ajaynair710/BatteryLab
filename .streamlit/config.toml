@@ -3,4 +3,5 @@ gatherUsageStats = false
 
 [server]
 headless = true
+maxUploadSize = 3000
 

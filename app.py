@@ -312,12 +312,42 @@ def _extract_cycle_features(cycle_data: pd.DataFrame):
     if len(cycle_data) == 0:
         return features
     
+    # Ensure cycle column is numeric and drop invalid cycles
+    cycle_data = cycle_data.copy()
+    cycle_data['cycle'] = pd.to_numeric(cycle_data['cycle'], errors='coerce')
+    cycle_data = cycle_data.dropna(subset=['cycle'])
+    
+    if len(cycle_data) == 0:
+        return features
+
+    # Check if we need to aggregate (multiple rows per cycle)
+    # We suspect this if the number of rows > number of unique cycles
+    n_unique = cycle_data['cycle'].nunique()
+    
+    if len(cycle_data) > n_unique:
+        # Aggregate by cycle for summary statistics
+        # Capacity: take MAX (assuming we want the full capacity of that cycle)
+        # IR/Temp: take MEAN
+        agg_rules = {
+            'discharge_capacity': 'max',
+        }
+        if 'internal_resistance' in cycle_data.columns:
+            agg_rules['internal_resistance'] = 'mean'
+        if 'temperature' in cycle_data.columns:
+            agg_rules['temperature'] = 'mean'
+            
+        # Group and aggregate
+        cycle_data_agg = cycle_data.groupby('cycle').agg(agg_rules).reset_index()
+        cycle_data_agg = cycle_data_agg.sort_values('cycle')
+    else:
+        cycle_data_agg = cycle_data
+
     # Basic stats
-    features['n_cycles'] = int(len(cycle_data))
-    features['cycle_range'] = [int(cycle_data['cycle'].min()), int(cycle_data['cycle'].max())]
+    features['n_cycles'] = int(len(cycle_data_agg))
+    features['cycle_range'] = [int(cycle_data_agg['cycle'].min()), int(cycle_data_agg['cycle'].max())]
     
     # Capacity features
-    cap = cycle_data['discharge_capacity'].dropna()
+    cap = cycle_data_agg['discharge_capacity'].dropna()
     if len(cap) > 0:
         features['capacity_max_Ah'] = float(cap.max())
         features['capacity_min_Ah'] = float(cap.min())
@@ -329,7 +359,7 @@ def _extract_cycle_features(cycle_data: pd.DataFrame):
         # Fade rate calculations
         if len(cap) >= 2:
             # Linear fade rate (% per cycle)
-            cycles = cycle_data['cycle'].dropna().values
+            cycles = cycle_data_agg['cycle'].dropna().values
             if len(cycles) == len(cap):
                 valid_mask = np.isfinite(cap.values) & np.isfinite(cycles)
                 if np.sum(valid_mask) >= 2:
@@ -343,25 +373,27 @@ def _extract_cycle_features(cycle_data: pd.DataFrame):
                 features['total_fade_percent'] = float(total_fade_pct)
     
     # Internal resistance features
-    ir = cycle_data['internal_resistance'].dropna()
-    if len(ir) > 0:
-        features['ir_max_Ohm'] = float(ir.max())
-        features['ir_min_Ohm'] = float(ir.min())
-        features['ir_mean_Ohm'] = float(ir.mean())
-        features['ir_std_Ohm'] = float(ir.std()) if len(ir) > 1 else 0.0
-        features['ir_initial_Ohm'] = float(ir.iloc[0]) if len(ir) > 0 else np.nan
-        features['ir_final_Ohm'] = float(ir.iloc[-1]) if len(ir) > 0 else np.nan
-        if features['ir_initial_Ohm'] > 0:
-            ir_growth_pct = 100.0 * (features['ir_final_Ohm'] - features['ir_initial_Ohm']) / features['ir_initial_Ohm']
-            features['ir_growth_percent'] = float(ir_growth_pct)
+    if 'internal_resistance' in cycle_data_agg.columns:
+        ir = cycle_data_agg['internal_resistance'].dropna()
+        if len(ir) > 0:
+            features['ir_max_Ohm'] = float(ir.max())
+            features['ir_min_Ohm'] = float(ir.min())
+            features['ir_mean_Ohm'] = float(ir.mean())
+            features['ir_std_Ohm'] = float(ir.std()) if len(ir) > 1 else 0.0
+            features['ir_initial_Ohm'] = float(ir.iloc[0]) if len(ir) > 0 else np.nan
+            features['ir_final_Ohm'] = float(ir.iloc[-1]) if len(ir) > 0 else np.nan
+            if features['ir_initial_Ohm'] > 0:
+                ir_growth_pct = 100.0 * (features['ir_final_Ohm'] - features['ir_initial_Ohm']) / features['ir_initial_Ohm']
+                features['ir_growth_percent'] = float(ir_growth_pct)
     
     # Temperature features
-    temp = cycle_data['temperature'].dropna()
-    if len(temp) > 0:
-        features['temp_max_C'] = float(temp.max())
-        features['temp_min_C'] = float(temp.min())
-        features['temp_mean_C'] = float(temp.mean())
-        features['temp_std_C'] = float(temp.std()) if len(temp) > 1 else 0.0
+    if 'temperature' in cycle_data_agg.columns:
+        temp = cycle_data_agg['temperature'].dropna()
+        if len(temp) > 0:
+            features['temp_max_C'] = float(temp.max())
+            features['temp_min_C'] = float(temp.min())
+            features['temp_mean_C'] = float(temp.mean())
+            features['temp_std_C'] = float(temp.std()) if len(temp) > 1 else 0.0
     
     return features
 
@@ -2699,7 +2731,8 @@ with tab2:
                                 st.metric("IR Growth", f"{cycle_features['ir_growth_percent']:.2f}%")
                         
                         with col_sum3:
-                            st.metric("Total Cycles", f"{cycle_features.get('n_cycles', 0)}")
+                            c_min, c_max = cycle_features.get('cycle_range', [0, 0])
+                            st.metric("Total Cycles", f"{cycle_features.get('n_cycles', 0)} ({c_min}–{c_max})")
                         
                         st.divider()
                         

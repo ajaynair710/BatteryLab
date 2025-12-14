@@ -28,7 +28,7 @@ This prototype combines:
   - Resampling options: Uniform capacity/voltage axis, or uniform time frequency (1Hz).
   - Automatic harmonization of column names and units.
 
-- Prototype Streamlit app for scouts & demos
+- Prototype Streamlit app :
 
 - **[Try the Live Prototype](https://batterylab.streamlit.app/)**
 

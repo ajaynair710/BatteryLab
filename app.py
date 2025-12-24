@@ -1303,7 +1303,7 @@ with tab2:
             "2. **Voltage-Capacity curves**: Columns: Voltage, Capacity_Ah (or Capacity_mAh). Optional: Cycle (e.g., Fresh/Aged)."
         )
 
-        up = st.file_uploader("Upload CSV or MAT file", type=["csv", "mat"])
+        up = st.file_uploader("Upload CSV, MAT or Excel file", type=["csv", "mat", "xlsx", "xls"])
         if up is not None:
             # Check file size before processing
             file_size_mb = len(up.getvalue()) / (1024 * 1024)
@@ -1393,6 +1393,57 @@ with tab2:
                 name = up.name.lower()
                 if name.endswith(".csv"):
                     df = pd.read_csv(up)
+                elif name.endswith(".xlsx") or name.endswith(".xls"):
+                    try:
+                        # Extract metadata if available
+                        metadata = {}
+                        try:
+                            from cleaning_module import extract_excel_metadata
+                            up.seek(0)
+                            metadata = extract_excel_metadata(up)
+                            up.seek(0)
+                        except: pass
+                        
+                        all_sheets = get_excel_sheets(up)
+                        channel_sheets = filter_channel_sheets(all_sheets)
+                        
+                        if len(all_sheets) > 1:
+                            st.info(f"Found {len(all_sheets)} sheet(s): {', '.join(all_sheets)}")
+                            sheets_to_show = channel_sheets if channel_sheets else [s for s in all_sheets if s.lower() != 'info']
+                            
+                            selected_sheets = st.multiselect(
+                                "Select sheets to analyze",
+                                options=sheets_to_show,
+                                default=sheets_to_show[:1],
+                                help="Select which sheets to combine for analysis"
+                            )
+                            
+                            if not selected_sheets:
+                                st.warning("Please select at least one sheet.")
+                                st.stop()
+                                
+                            up.seek(0)
+                            sheets_data = read_excel_sheets(up, selected_sheets)
+                            dfs = []
+                            for s in selected_sheets:
+                                if s in sheets_data:
+                                    temp_df = sheets_data[s].copy()
+                                    temp_df.insert(0, 'Sheet_Source', s)
+                                    dfs.append(temp_df)
+                            
+                            if dfs:
+                                df = pd.concat(dfs, ignore_index=True)
+                            else:
+                                st.error("No data found in selected sheets.")
+                                st.stop()
+                        else:
+                            # Single sheet
+                            up.seek(0)
+                            df = pd.read_excel(up)
+                            
+                    except Exception as e:
+                        st.error(f"Error loading Excel file: {e}")
+                        st.stop()
                 elif name.endswith(".mat"):
                     if not SCIPY_OK:
                         st.error("SciPy not available. Please upload a CSV for now.")

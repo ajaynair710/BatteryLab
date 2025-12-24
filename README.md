@@ -16,7 +16,7 @@ This prototype combines:
 - Hybrid modeling: physics-based + machine learning
 
 - **Data Analytics Tab**:
-  - Upload CSV or MAT files for instant analysis.
+  - Upload CSV, MAT, or Excel files for instant analysis.
   - Robust cycle counting: Automatically handles time-series data (multiple rows per cycle) and invalid entries.
   - Automatic feature extraction: Capacity fade, IR growth, and temperature trends.
   - Interactive visualizations: Voltage curves, dQ/dV analysis, and cycle life plots.

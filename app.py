@@ -72,7 +72,7 @@ if "cleaning_applied" not in st.session_state:
 # =========================
 # Helpers (shared)
 # =========================
-def _downsample_series(df: pd.DataFrame, max_points: int = 5000) -> pd.DataFrame:
+def _downsample_series(df: pd.DataFrame, max_points: int = 10000) -> pd.DataFrame:
     """Downsample a DataFrame to a maximum number of points while preserving shape."""
     if len(df) <= max_points:
         return df
@@ -242,34 +242,99 @@ def _prep_series(voltage, capacity):
     order = np.argsort(V)
     return V[order], Q[order]
 
-def _extract_features(V, Q):
-    Qs = Q.copy()
-    if SCIPY_OK and len(Q) >= 11:
+def _compute_robust_dqdv(voltage, capacity, window_length=15, polyorder=2):
+    """
+    Compute a robust dQ/dV curve using sorting, linear interpolation, and smoothing.
+    """
+    # 1. Basic Cleaning
+    V = pd.to_numeric(voltage, errors='coerce').to_numpy()
+    Q = pd.to_numeric(capacity, errors='coerce').to_numpy()
+    
+    mask = np.isfinite(V) & np.isfinite(Q)
+    V = V[mask]
+    Q = Q[mask]
+    
+    if len(V) < 5:
+        return V, np.zeros_like(V)
+        
+    # 2. Sort by Voltage
+    sorted_idx = np.argsort(V)
+    V_sorted = V[sorted_idx]
+    Q_sorted = Q[sorted_idx]
+    
+    # 3. Drop duplicates in V to allow interpolation
+    _, unique_idx = np.unique(V_sorted, return_index=True)
+    V_unique = V_sorted[unique_idx]
+    Q_unique = Q_sorted[unique_idx]
+    
+    if len(V_unique) < 5:
+        return V_unique, np.zeros_like(V_unique)
+        
+    # 4. Interpolate to a uniform grid (optional but helps with stability)
+    # create a grid with roughly same number of points, but capped to avoid excessive noise/size
+    grid_size = min(len(V_unique), 2000)
+    V_grid = np.linspace(V_unique.min(), V_unique.max(), grid_size)
+    Q_grid = np.interp(V_grid, V_unique, Q_unique)
+    
+    # 5. Smooth Capacity (Savitzky-Golay)
+    # Ensure window_length is odd and <= len(Q_grid)
+    # Adaptive window length: ~1-2% of grid size
+    target_wl = max(15, int(grid_size * 0.02))
+    if target_wl % 2 == 0: target_wl += 1
+    
+    wl = target_wl
+    if wl > len(Q_grid): wl = len(Q_grid) if len(Q_grid) % 2 != 0 else len(Q_grid) - 1
+    
+    if SCIPY_OK and wl >= 5:
         try:
-            Qs = savgol_filter(Q, 11, 3)
-        except Exception:
-            pass
-    dQdV = np.gradient(Qs, V, edge_order=2)
+            Q_smooth = savgol_filter(Q_grid, wl, polyorder)
+        except:
+            Q_smooth = Q_grid
+    else:
+        Q_smooth = Q_grid
+        
+    # 6. Calculate Gradient dQ/dV
+    dQ = np.gradient(Q_smooth)
+    dV = np.gradient(V_grid)
+    
+    # Avoid div by zero
+    mask_dv = np.abs(dV) > 1e-8
+    dQdV = np.zeros_like(V_grid)
+    dQdV[mask_dv] = dQ[mask_dv] / dV[mask_dv]
+    
+    return V_grid, dQdV
+
+def _extract_features(V, Q):
+    # Use robust dQ/dV calculation
+    V_robust, dQdV = _compute_robust_dqdv(V, Q)
+    
     peak_info = {"n_peaks": 0, "voltages": [], "widths_V": []}
     if SCIPY_OK and np.isfinite(dQdV).any():
         try:
             prom = np.nanmax(np.abs(dQdV))*0.05 if np.nanmax(np.abs(dQdV))>0 else 0.0
             peaks, _ = find_peaks(dQdV, prominence=prom)
             peak_info["n_peaks"] = int(len(peaks))
-            peak_info["voltages"] = [float(V[p]) for p in peaks]
+            peak_info["voltages"] = [float(V_robust[p]) for p in peaks]
             if len(peaks) > 0:
                 widths, _, _, _ = peak_widths(dQdV, peaks, rel_height=0.5)
-                if len(V) > 1:
-                    dv = np.mean(np.diff(V))
+                if len(V_robust) > 1:
+                    dv = np.mean(np.diff(V_robust))
                     peak_info["widths_V"] = [float(w*dv) for w in widths]
         except Exception:
             pass
+    
+    # Estimate noise level (median |dV/dQ|)
     try:
-        dVdQ = np.gradient(V, Qs, edge_order=2)
-        dVdQ_med = float(np.nanmedian(np.abs(dVdQ)))
+        # Approximate dV/dQ as 1/(dQ/dV)
+        valid = (np.abs(dQdV) > 1e-6) & np.isfinite(dQdV)
+        if np.any(valid):
+            dVdQ_med = float(np.nanmedian(np.abs(1.0 / dQdV[valid])))
+        else:
+            dVdQ_med = float("nan")
     except Exception:
         dVdQ_med = float("nan")
-    return dQdV, peak_info, dVdQ_med
+        
+    return V_robust, dQdV, peak_info, dVdQ_med
 
 def _compare_two_sets(name_a, feat_a, name_b, feat_b):
     interp = []
@@ -306,11 +371,16 @@ def _compare_two_sets(name_a, feat_a, name_b, feat_b):
     return interp
 
 def _extract_cycle_features(cycle_data: pd.DataFrame):
-    """Extract key features from cycle-level data"""
+    """Extract key features from cycle-level data.
+    
+    Returns:
+        tuple: (features_dict, cycle_data_agg) where cycle_data_agg is the 
+               aggregated/corrected DataFrame ready for plotting.
+    """
     features = {}
     
     if len(cycle_data) == 0:
-        return features
+        return features, cycle_data
     
     # Ensure cycle column is numeric and drop invalid cycles
     cycle_data = cycle_data.copy()
@@ -318,7 +388,7 @@ def _extract_cycle_features(cycle_data: pd.DataFrame):
     cycle_data = cycle_data.dropna(subset=['cycle'])
     
     if len(cycle_data) == 0:
-        return features
+        return features, cycle_data
 
     # Check if we need to aggregate (multiple rows per cycle)
     # We suspect this if the number of rows > number of unique cycles
@@ -326,10 +396,10 @@ def _extract_cycle_features(cycle_data: pd.DataFrame):
     
     if len(cycle_data) > n_unique:
         # Aggregate by cycle for summary statistics
-        # Capacity: take MAX (assuming we want the full capacity of that cycle)
-        # IR/Temp: take MEAN
+        # Capacity: take MAX (battery cycler data accumulates within each cycle, starting from 0)
+        # The MAX value represents the total capacity discharged in that cycle
         agg_rules = {
-            'discharge_capacity': 'max',
+            'discharge_capacity': 'max',  # Use max since capacity accumulates from 0 within each cycle
         }
         if 'internal_resistance' in cycle_data.columns:
             agg_rules['internal_resistance'] = 'mean'
@@ -339,8 +409,26 @@ def _extract_cycle_features(cycle_data: pd.DataFrame):
         # Group and aggregate
         cycle_data_agg = cycle_data.groupby('cycle').agg(agg_rules).reset_index()
         cycle_data_agg = cycle_data_agg.sort_values('cycle')
+        
+        # Check if the aggregated capacity is CUMULATIVE ACROSS CYCLES
+        # (i.e., capacity keeps increasing with cycle number, not resetting per cycle)
+        # This happens when the data logger records total throughput, not per-cycle capacity
+        cap_values = cycle_data_agg['discharge_capacity'].values
+        if len(cap_values) >= 3:
+            # Check if capacity is monotonically increasing (within tolerance for noise)
+            diffs = np.diff(cap_values)
+            pct_positive = np.sum(diffs > 0) / len(diffs) if len(diffs) > 0 else 0
+            
+            # If >90% of diffs are positive and final >> initial, it's cumulative
+            if pct_positive > 0.9 and cap_values[-1] > cap_values[0] * 2:
+                # This is cumulative throughput - convert to per-cycle by differencing
+                per_cycle_cap = np.diff(cap_values, prepend=0)
+                # First value should use the actual first MAX (since 0 was prepended)
+                per_cycle_cap[0] = cap_values[0]
+                cycle_data_agg['discharge_capacity'] = per_cycle_cap
     else:
-        cycle_data_agg = cycle_data
+        cycle_data_agg = cycle_data.copy()
+        cycle_data_agg = cycle_data_agg.sort_values('cycle')
 
     # Basic stats
     features['n_cycles'] = int(len(cycle_data_agg))
@@ -395,7 +483,7 @@ def _extract_cycle_features(cycle_data: pd.DataFrame):
             features['temp_mean_C'] = float(temp.mean())
             features['temp_std_C'] = float(temp.std()) if len(temp) > 1 else 0.0
     
-    return features
+    return features, cycle_data_agg
 
 def _assess_data_quality_and_richness(cycle_data: pd.DataFrame, time_series: dict, cycle_features: dict):
     """Assess data quality and richness for cycle-level battery data"""
@@ -2554,12 +2642,49 @@ with tab2:
                         if ts_cols:
                             role_map['time_series_example'] = ts_cols[:6]
 
-                        if role_map:
-                            st.markdown("**Inferred roles:**")
-                            for k, v in role_map.items():
-                                st.write(f"- {k}: {v}")
-                        else:
-                            st.info("No standard cycle-level roles inferred from column names. The app will attempt heuristic detection.")
+                        # [NEW] Column Mapping UI
+                        with st.expander("Select Columns for Analysis", expanded=True):
+                            st.info("Please confirm the column selection below. This ensures the graphs and analysis are accurate.")
+                            
+                            col_options = ["— none —"] + list(cols)
+                            
+                            def _get_idx(key):
+                                # Helper to find index of deduced column
+                                if key in role_map and role_map[key] in col_options:
+                                    return col_options.index(role_map[key])
+                                return 0
+
+                            # Try to deduce voltage/current for defaults if not in role_map
+                            def _deduce_col(keywords):
+                                for c in cols:
+                                    c_norm = c.lower().replace('_', '').replace(' ', '')
+                                    for k in keywords:
+                                        if k in c_norm: return c
+                                return None
+
+                            # Defaults
+                            default_volt = _deduce_col(['voltage', 'volt', 'v']) if 'voltage' not in role_map else role_map['voltage']
+                            default_curr = _deduce_col(['current', 'curr', 'i', 'amps']) if 'current' not in role_map else role_map['current']
+                            
+                            # Interactive Selectboxes
+                            c_temp = st.selectbox("Temperature", col_options, index=_get_idx('temperature'))
+                            c_curr = st.selectbox("Current", col_options, index=(col_options.index(default_curr) if default_curr in col_options else 0))
+                            c_volt = st.selectbox("Voltage", col_options, index=(col_options.index(default_volt) if default_volt in col_options else 0))
+                            c_cycle = st.selectbox("Cycle", col_options, index=_get_idx('cycle'))
+                            c_cap = st.selectbox("Discharge Capacity", col_options, index=_get_idx('discharge_capacity'))
+
+                            # Apply mapping (renaming columns in the DataFrame)
+                            rename_map = {}
+                            # Use standard names that the rest of the app expects
+                            if c_cycle != "— none —": rename_map[c_cycle] = "cycle"
+                            if c_volt != "— none —": rename_map[c_volt] = "voltage"
+                            if c_curr != "— none —": rename_map[c_curr] = "current"
+                            if c_temp != "— none —": rename_map[c_temp] = "temperature"
+                            if c_cap != "— none —": rename_map[c_cap] = "discharge_capacity"
+                            
+                            if rename_map:
+                                df = df.rename(columns=rename_map)
+                                st.caption(f"mapped: {list(rename_map.keys())} -> {list(rename_map.values())}")
                     except Exception as e:
                         # Fallback to simple display if detailed display fails
                         try:
@@ -2577,6 +2702,35 @@ with tab2:
                         cycle_data = _parse_cycle_level_data(df)
                         time_series = _parse_time_series_columns(df)
                         
+                        # [NEW] Handle flat time-series data (Cycle, Voltage, Current columns)
+                        if 'voltage' in df.columns and 'cycle' in df.columns:
+                            # If we have flat data (Voltage, Cycle), we can generate curves
+                            # Check if we have enough data (e.g. > 10 points per cycle average) to justify plotting
+                            if len(df) > len(cycle_data) * 10: 
+                                st.session_state.cycles_time_series = df.rename(columns={'discharge_capacity': 'Qdlin', 'cycle': 'cycle_number'})
+                                
+                                # Also populate time_series dict for the "Time Series Plots"
+                                if 'current' in df.columns:
+                                    # Extract for a few cycles only to save memory/time
+                                    cycles = sorted(df['cycle'].unique())
+                                    if len(cycles) > 3:
+                                        selected_cycles = [cycles[0], cycles[len(cycles)//2], cycles[-1]]
+                                    else:
+                                        selected_cycles = cycles
+                                    
+                                    for c in selected_cycles:
+                                        sub = df[df['cycle'] == c]
+                                        if c not in time_series:
+                                            time_series[c] = {}
+                                        time_series[c]['voltage'] = sub['voltage'].values
+                                        time_series[c]['current'] = sub['current'].values if 'current' in sub.columns else None
+                                        
+                                        # Use 'time' if available, else synthetic
+                                        if 'time' in sub.columns:
+                                            time_series[c]['time'] = sub['time'].values
+                                        else:
+                                            time_series[c]['time'] = np.arange(len(sub))
+
                         # Merge with time-series data extracted from .mat arrays if available
                         if name.endswith(".mat") and 'mat_time_series' in st.session_state:
                             mat_ts = st.session_state.mat_time_series
@@ -2637,32 +2791,12 @@ with tab2:
                                                 # Calculate dQ/dV for ICA plot
                                                 if SCIPY_OK and len(V_clean) > 3:
                                                     try:
-                                                        # Use savgol_filter for smoothing if enough points
-                                                        if len(Q_clean) > 5:
-                                                            Q_smooth = savgol_filter(Q_clean, min(5, len(Q_clean)//2*2+1), 3)
-                                                        else:
-                                                            Q_smooth = Q_clean
-                                                        
-                                                        # Calculate dQ/dV
-                                                        dV = np.diff(V_clean)
-                                                        dQ = np.diff(Q_smooth)
-                                                        
-                                                        # Avoid division by zero
-                                                        valid_dv = np.abs(dV) > 1e-6
-                                                        if np.any(valid_dv):
-                                                            dQdV = np.zeros_like(V_clean)
-                                                            dQdV[1:][valid_dv] = dQ[valid_dv] / dV[valid_dv]
-                                                            dQdV[~valid_dv] = np.nan
-                                                            
-                                                            # Use voltage at mid-points for dQ/dV
-                                                            V_mid = (V_clean[:-1] + V_clean[1:]) / 2
-                                                            dQdV_mid = dQdV[1:]
-                                                            
-                                                            ica_rows.append(pd.DataFrame({
-                                                                'Voltage': V_mid,
-                                                                'dQdV': dQdV_mid,
-                                                                'Cycle': f'Cycle {int(cycle_num)}'
-                                                            }))
+                                                        V_robust, dQdV_robust = _compute_robust_dqdv(V_clean, Q_clean)
+                                                        ica_rows.append(pd.DataFrame({
+                                                            'Voltage': V_robust,
+                                                            'dQdV': dQdV_robust,
+                                                            'Cycle': f'Cycle {int(cycle_num)}'
+                                                        }))
                                                     except:
                                                         pass
                                 
@@ -2677,10 +2811,12 @@ with tab2:
                             st.error("Could not parse cycle-level data. Please check column names.")
                             st.stop()
                         
-                        # Extract cycle features
-                        cycle_features = _extract_cycle_features(cycle_data)
-                        degradation_interps = _generate_degradation_interpretations(cycle_features, cycle_data)
-                        quality_notes, richness_notes = _assess_data_quality_and_richness(cycle_data, time_series, cycle_features)
+                        # Extract cycle features AND get corrected data for plotting
+                        cycle_features, cycle_data_plot = _extract_cycle_features(cycle_data)
+                        
+                        # Use cycle_data_plot for visualizations (it has correct per-cycle capacity)
+                        degradation_interps = _generate_degradation_interpretations(cycle_features, cycle_data_plot)
+                        quality_notes, richness_notes = _assess_data_quality_and_richness(cycle_data_plot, time_series, cycle_features)
                         
                         # ============================================================
                         # DATA QUALITY & RICHNESS ASSESSMENT
@@ -2710,8 +2846,8 @@ with tab2:
                         features_data = []
                         
                         # Capacity features
-                        if 'discharge_capacity' in cycle_data.columns:
-                            cap_valid = cycle_data['discharge_capacity'].dropna()
+                        if 'discharge_capacity' in cycle_data_plot.columns:
+                            cap_valid = cycle_data_plot['discharge_capacity'].dropna()
                             if len(cap_valid) > 0:
                                 features_data.append({
                                     "Parameter": "Discharge Capacity",
@@ -2724,8 +2860,8 @@ with tab2:
                                 })
                         
                         # Internal Resistance features
-                        if 'internal_resistance' in cycle_data.columns:
-                            ir_valid = cycle_data['internal_resistance'].dropna()
+                        if 'internal_resistance' in cycle_data_plot.columns:
+                            ir_valid = cycle_data_plot['internal_resistance'].dropna()
                             if len(ir_valid) > 0:
                                 features_data.append({
                                     "Parameter": "Internal Resistance",
@@ -2738,8 +2874,8 @@ with tab2:
                                 })
                         
                         # Temperature features
-                        if 'temperature' in cycle_data.columns:
-                            temp_valid = cycle_data['temperature'].dropna()
+                        if 'temperature' in cycle_data_plot.columns:
+                            temp_valid = cycle_data_plot['temperature'].dropna()
                             if len(temp_valid) > 0:
                                 features_data.append({
                                     "Parameter": "Temperature",
@@ -2797,8 +2933,8 @@ with tab2:
                         
                         # Plot 1: Discharge Capacity vs Cycle Life
                         with col1:
-                            if 'discharge_capacity' in cycle_data.columns:
-                                cap_data = cycle_data.dropna(subset=['cycle', 'discharge_capacity'])
+                            if 'discharge_capacity' in cycle_data_plot.columns:
+                                cap_data = cycle_data_plot.dropna(subset=['cycle', 'discharge_capacity'])
                                 if len(cap_data) > 0:
                                     # Downsample for plotting to avoid browser crash
                                     plot_data = _downsample_series(cap_data, max_points=3000)
@@ -2815,8 +2951,8 @@ with tab2:
                         
                         # Plot 2: Internal Resistance vs Cycle Life
                         with col2:
-                            if 'internal_resistance' in cycle_data.columns and cycle_data['internal_resistance'].notna().any():
-                                ir_data = cycle_data.dropna(subset=['cycle', 'internal_resistance'])
+                            if 'internal_resistance' in cycle_data_plot.columns and cycle_data_plot['internal_resistance'].notna().any():
+                                ir_data = cycle_data_plot.dropna(subset=['cycle', 'internal_resistance'])
                                 if len(ir_data) > 0:
                                     plot_data = _downsample_series(ir_data, max_points=3000)
                                     ir_chart = alt.Chart(plot_data).mark_line(point={'size': 100}, color='#FF6B6B').encode(
@@ -2833,8 +2969,8 @@ with tab2:
                         # Plot 3: Temperature vs Cycle Life
                         col3, col4 = st.columns(2, gap="medium")
                         with col3:
-                            if 'temperature' in cycle_data.columns and cycle_data['temperature'].notna().any():
-                                temp_data = cycle_data.dropna(subset=['cycle', 'temperature'])
+                            if 'temperature' in cycle_data_plot.columns and cycle_data_plot['temperature'].notna().any():
+                                temp_data = cycle_data_plot.dropna(subset=['cycle', 'temperature'])
                                 if len(temp_data) > 0:
                                     plot_data = _downsample_series(temp_data, max_points=3000)
                                     temp_chart = alt.Chart(plot_data).mark_line(point={'size': 100}, color='#FFA500').encode(
@@ -3060,13 +3196,13 @@ with tab2:
                         if SCIPY_OK:
                             mat_buf = io.BytesIO()
                             mat_data = {
-                                'cycle': cycle_data['cycle'].values.astype(float),
-                                'discharge_capacity': cycle_data['discharge_capacity'].values.astype(float),
+                                'cycle': cycle_data_plot['cycle'].values.astype(float),
+                                'discharge_capacity': cycle_data_plot['discharge_capacity'].values.astype(float),
                             }
-                            if 'internal_resistance' in cycle_data.columns:
-                                mat_data['internal_resistance'] = cycle_data['internal_resistance'].values.astype(float)
-                            if 'temperature' in cycle_data.columns:
-                                mat_data['temperature'] = cycle_data['temperature'].values.astype(float)
+                            if 'internal_resistance' in cycle_data_plot.columns:
+                                mat_data['internal_resistance'] = cycle_data_plot['internal_resistance'].values.astype(float)
+                            if 'temperature' in cycle_data_plot.columns:
+                                mat_data['temperature'] = cycle_data_plot['temperature'].values.astype(float)
                             
                             # Add time-series data if available
                             if time_series:
@@ -3090,7 +3226,7 @@ with tab2:
                         
                         # PDF Download
                         pdf_bytes = generate_pdf_report(
-                            cycle_data=cycle_data,
+                            cycle_data=cycle_data_plot,
                             cycle_features=cycle_features,
                             degradation_interps=degradation_interps,
                             time_series=time_series
@@ -3120,7 +3256,7 @@ with tab2:
                             V, Q = _prep_series(sub[vcol], sub[qcol])
                             if len(V) < 5:
                                 continue
-                            dQdV, peak_info, dVdQ_med = _extract_features(V, Q)
+                            V_robust, dQdV, peak_info, dVdQ_med = _extract_features(V, Q)
                             features_by_group[g] = {
                                 "n_samples": int(len(V)),
                                 "voltage_range_V": [float(np.nanmin(V)), float(np.nanmax(V))],
@@ -3131,7 +3267,7 @@ with tab2:
                                 "dVdQ_median_abs": dVdQ_med,
                             }
                             vc_all_rows.append(pd.DataFrame({"Voltage": V, "Capacity_Ah": Q, "Cycle": g}))
-                            ica_all_rows.append(pd.DataFrame({"Voltage": V, "dQdV": dQdV, "Cycle": g}))
+                            ica_all_rows.append(pd.DataFrame({"Voltage": V_robust, "dQdV": dQdV, "Cycle": g}))
 
                         if not features_by_group:
                             st.error("Not enough valid data points to analyze.")
@@ -3668,7 +3804,7 @@ with tab3:
                         voltage_points = st.number_input("Voltage grid points", min_value=100, value=1000, step=100)
                 
                 with col_phase3_2:
-                    resample_uniform_frequency = st.checkbox("Resample to uniform frequency (1 Hz)", value=True,
+                    resample_uniform_frequency = st.checkbox("Resample to uniform frequency (1 Hz)", value=False,
                                                              help="Essential for ICA/dQ/dV analysis. Resamples data to uniform time spacing.")
                     frequency_hz = 1.0
                     if resample_uniform_frequency:

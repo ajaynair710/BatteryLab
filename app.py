@@ -3,6 +3,7 @@
 # ==============================================================
 
 import io
+from io import BytesIO
 import json
 import warnings
 import numpy as np
@@ -10,6 +11,7 @@ import pandas as pd
 import streamlit as st
 import altair as alt
 import random, time  # for Copilot typing effect
+import os  # for temp file handling
 
 # Suppress numpy divide/nan warnings for gradient calculations
 warnings.filterwarnings("ignore", category=RuntimeWarning, message=".*divide by zero.*")
@@ -40,7 +42,7 @@ except Exception:
 from batterylab_recipe_engine import ElectrodeSpec, CellDesignInput, design_pouch
 
 # Data cleaning module
-from cleaning_module import clean_dataframe, get_dataframe_info, to_csv_download, get_excel_sheets, read_excel_sheets, filter_channel_sheets, validate_analysis_compatibility, to_mat_download, export_to_cell11_mat_format
+from cleaning_module import clean_dataframe, get_dataframe_info, to_csv_download, get_excel_sheets, read_excel_sheets, filter_channel_sheets, validate_analysis_compatibility, to_mat_download, export_to_cell11_mat_format, read_file_universal
 
 # ---------------------------
 # Streamlit page config
@@ -3534,9 +3536,9 @@ with tab3:
         
         # File uploader
         uploaded_file = st.file_uploader(
-            "Upload CSV or Excel file",
-            type=["csv", "xlsx", "xls"],
-            help="Supported formats: .csv, .xlsx, .xls"
+            "Upload battery data file",
+            type=["csv", "xlsx", "xls", "json", "txt", "dat", "h5", "hdf5", "db", "sqlite", "sqlite3", "mat"],
+            help="Supports: Excel (.xlsx, .xls), CSV (.csv), JSON (.json), Text (.txt, .dat), HDF5 (.h5, .hdf5), SQLite (.db, .sqlite), MATLAB (.mat)"
         )
         
         if uploaded_file is not None:
@@ -3554,8 +3556,47 @@ with tab3:
                 metadata = {}
                 
                 if file_extension == 'csv':
-                    df_original = pd.read_csv(uploaded_file)
+                    df_original = read_file_universal(uploaded_file, file_type='csv')
                     st.session_state.file_type = 'csv'
+                elif file_extension in ['json']:
+                    df_original = read_file_universal(uploaded_file, file_type='json')
+                    st.session_state.file_type = 'json'
+                elif file_extension in ['txt', 'dat']:
+                    df_original = read_file_universal(uploaded_file, file_type='txt')
+                    st.session_state.file_type = 'txt'
+                elif file_extension in ['h5', 'hdf5']:
+                    # HDF5 requires file path, not buffer - save temporarily
+                    import tempfile
+                    with tempfile.NamedTemporaryFile(delete=False, suffix='.h5') as tmp_file:
+                        tmp_file.write(uploaded_file.read())
+                        tmp_path = tmp_file.name
+                    try:
+                        df_original = read_file_universal(tmp_path, file_type='hdf5')
+                        st.session_state.file_type = 'hdf5'
+                    finally:
+                        os.unlink(tmp_path)  # Clean up temp file
+                elif file_extension in ['db', 'sqlite', 'sqlite3']:
+                    # SQLite requires file path, not buffer - save temporarily
+                    import tempfile
+                    with tempfile.NamedTemporaryFile(delete=False, suffix='.db') as tmp_file:
+                        tmp_file.write(uploaded_file.read())
+                        tmp_path = tmp_file.name
+                    try:
+                        df_original = read_file_universal(tmp_path, file_type='sql')
+                        st.session_state.file_type = 'sql'
+                    finally:
+                        os.unlink(tmp_path)  # Clean up temp file
+                elif file_extension == 'mat':
+                    # MATLAB files - save temporarily
+                    import tempfile
+                    with tempfile.NamedTemporaryFile(delete=False, suffix='.mat') as tmp_file:
+                        tmp_file.write(uploaded_file.read())
+                        tmp_path = tmp_file.name
+                    try:
+                        df_original = read_file_universal(tmp_path, file_type='mat')
+                        st.session_state.file_type = 'mat'
+                    finally:
+                        os.unlink(tmp_path)  # Clean up temp file
                 elif is_excel:
                     try:
                         # Try importing openpyxl first
@@ -3668,7 +3709,7 @@ with tab3:
                         st.info("**Troubleshooting:**\n- Make sure the file is a valid Excel file (.xlsx or .xls)\n- Check if the file is corrupted\n- Try opening it in Excel first to verify it's valid")
                         st.stop()
                 else:
-                    st.error("Unsupported file format. Please upload a CSV or Excel file.")
+                    st.error(f"Unsupported file format: {file_extension}. Supported formats: CSV, Excel (.xlsx, .xls), JSON, Text (.txt, .dat), HDF5 (.h5, .hdf5), SQLite (.db, .sqlite), MATLAB (.mat)")
                     st.stop()
                 
                 st.success(f"File loaded successfully! Shape: {df_original.shape[0]} rows × {df_original.shape[1]} columns")

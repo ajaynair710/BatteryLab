@@ -1250,6 +1250,216 @@ def verify_electrochemical_anomalies(df: pd.DataFrame) -> pd.DataFrame:
 # PHASE 3: Preprocessing for Feature Extraction
 # ============================================================================
 
+def detect_time_continuity_issues(df: pd.DataFrame, max_gap_seconds: float = None) -> pd.DataFrame:
+    """
+    Detect time continuity issues: missing timestamps, duplicates, and large gaps.
+    
+    ENHANCED v2.0: Preserves original sampling rate and flags issues without modifying data
+    
+    Parameters:
+    -----------
+    df : pd.DataFrame
+        Input dataframe with 'Time' column
+    max_gap_seconds : float, optional
+        Maximum expected gap in seconds. If None, auto-detects from data.
+    
+    Returns:
+    --------
+    pd.DataFrame
+        Dataframe with 'Time_Continuity_Flag' and 'Gap_Duration' columns
+    """
+    df_clean = df.copy()
+    
+    if 'Time' not in df_clean.columns:
+        df_clean['Time_Continuity_Flag'] = False
+        df_clean['Gap_Duration'] = 0.0
+        return df_clean
+    
+    df_clean = df_clean.sort_values('Time').reset_index(drop=True)
+    
+    # Calculate time differences
+    time_diff = df_clean['Time'].diff()
+    
+    # Auto-detect expected gap threshold if not provided
+    if max_gap_seconds is None:
+        # Use median + 3*std as threshold for "normal" gaps
+        median_dt = time_diff.median()
+        std_dt = time_diff.std()
+        max_gap_seconds = median_dt + 3 * std_dt if not pd.isna(std_dt) else median_dt * 2
+    
+    # Flag large gaps
+    df_clean['Gap_Duration'] = time_diff.fillna(0)
+    df_clean['Time_Continuity_Flag'] = df_clean['Gap_Duration'] > max_gap_seconds
+    
+    # Detect duplicate timestamps
+    duplicate_times = df_clean['Time'].duplicated(keep=False)
+    df_clean.loc[duplicate_times, 'Time_Continuity_Flag'] = True
+    
+    return df_clean
+
+
+def analyze_sampling_characteristics(df: pd.DataFrame) -> dict:
+    """
+    Analyze sampling rate characteristics without modifying data.
+    
+    ENHANCED v2.0: Provides insights about sampling rate for informed decisions
+    
+    Parameters:
+    -----------
+    df : pd.DataFrame
+        Input dataframe with 'Time' column
+    
+    Returns:
+    --------
+    dict
+        Dictionary with sampling characteristics:
+        - sampling_rate_hz: float (average samples per second)
+        - is_uniform: bool (whether sampling is uniform)
+        - min_interval: float (minimum time interval)
+        - max_interval: float (maximum time interval)
+        - median_interval: float (median time interval)
+        - std_interval: float (standard deviation of intervals)
+        - total_samples: int
+        - total_duration: float (total time span)
+    """
+    if 'Time' not in df.columns:
+        return {
+            'sampling_rate_hz': 0.0,
+            'is_uniform': False,
+            'min_interval': 0.0,
+            'max_interval': 0.0,
+            'median_interval': 0.0,
+            'std_interval': 0.0,
+            'total_samples': len(df),
+            'total_duration': 0.0
+        }
+    
+    df_sorted = df.sort_values('Time').reset_index(drop=True)
+    time_diff = df_sorted['Time'].diff().dropna()
+    
+    if len(time_diff) == 0:
+        return {
+            'sampling_rate_hz': 0.0,
+            'is_uniform': False,
+            'min_interval': 0.0,
+            'max_interval': 0.0,
+            'median_interval': 0.0,
+            'std_interval': 0.0,
+            'total_samples': len(df),
+            'total_duration': 0.0
+        }
+    
+    median_interval = float(time_diff.median())
+    std_interval = float(time_diff.std())
+    min_interval = float(time_diff.min())
+    max_interval = float(time_diff.max())
+    
+    # Determine if sampling is uniform (coefficient of variation < 0.1)
+    cv = std_interval / (median_interval + 1e-10)
+    is_uniform = cv < 0.1
+    
+    # Calculate average sampling rate
+    sampling_rate_hz = 1.0 / (median_interval + 1e-10) if median_interval > 0 else 0.0
+    
+    # Total duration
+    total_duration = float(df_sorted['Time'].max() - df_sorted['Time'].min())
+    
+    return {
+        'sampling_rate_hz': sampling_rate_hz,
+        'is_uniform': is_uniform,
+        'min_interval': min_interval,
+        'max_interval': max_interval,
+        'median_interval': median_interval,
+        'std_interval': std_interval,
+        'total_samples': len(df),
+        'total_duration': total_duration
+    }
+
+
+def intelligent_resample_with_flagging(df: pd.DataFrame, target_frequency_hz: float = None, 
+                                       preserve_original: bool = True) -> Tuple[pd.DataFrame, dict]:
+    """
+    Intelligently resample data with flagging of interpolated points.
+    
+    ENHANCED v2.0: Only resamples if necessary and flags all interpolated data
+    
+    Parameters:
+    -----------
+    df : pd.DataFrame
+        Input dataframe with 'Time' column
+    target_frequency_hz : float, optional
+        Target sampling frequency. If None, uses original rate.
+    preserve_original : bool
+        If True, keeps original data and adds resampled columns with suffix '_resampled'
+    
+    Returns:
+    --------
+    Tuple[pd.DataFrame, dict]
+        Resampled dataframe and metadata dict with:
+        - interpolation_percentage: float (percentage of interpolated points)
+        - original_samples: int
+        - resampled_samples: int
+        - original_rate_hz: float
+        - target_rate_hz: float
+    """
+    if 'Time' not in df.columns:
+        return df, {'interpolation_percentage': 0.0, 'original_samples': len(df), 
+                   'resampled_samples': len(df), 'original_rate_hz': 0.0, 'target_rate_hz': 0.0}
+    
+    # Analyze original sampling
+    sampling_info = analyze_sampling_characteristics(df)
+    original_rate_hz = sampling_info['sampling_rate_hz']
+    
+    # If no target frequency specified, preserve original
+    if target_frequency_hz is None:
+        target_frequency_hz = original_rate_hz
+    
+    # If already at target frequency and uniform, no resampling needed
+    if (abs(target_frequency_hz - original_rate_hz) < 0.01 and 
+        sampling_info['is_uniform'] and 
+        not preserve_original):
+        return df, {
+            'interpolation_percentage': 0.0,
+            'original_samples': len(df),
+            'resampled_samples': len(df),
+            'original_rate_hz': original_rate_hz,
+            'target_rate_hz': target_frequency_hz
+        }
+    
+    # Perform resampling
+    df_resampled = resample_to_uniform_frequency(df, target_frequency_hz)
+    
+    # Add interpolation flag
+    df_resampled['Is_Interpolated'] = False
+    
+    # Mark interpolated points (points not in original time grid)
+    if 'Time' in df_resampled.columns:
+        original_times = set(df['Time'].values)
+        interpolated_mask = ~df_resampled['Time'].isin(original_times)
+        df_resampled.loc[interpolated_mask, 'Is_Interpolated'] = True
+    
+    interpolation_percentage = (df_resampled['Is_Interpolated'].sum() / len(df_resampled)) * 100
+    
+    metadata = {
+        'interpolation_percentage': float(interpolation_percentage),
+        'original_samples': len(df),
+        'resampled_samples': len(df_resampled),
+        'original_rate_hz': float(original_rate_hz),
+        'target_rate_hz': float(target_frequency_hz)
+    }
+    
+    if preserve_original:
+        # Keep original columns and add resampled versions
+        for col in ['Current', 'Voltage', 'Capacity', 'Temperature']:
+            if col in df_resampled.columns:
+                df_resampled[f'{col}_resampled'] = df_resampled[col]
+                if col in df.columns:
+                    # Reindex original data to resampled time grid using nearest neighbor
+                    df_resampled[col] = df[col].reindex(df_resampled.index, method='nearest')
+    
+    return df_resampled, metadata
+
+
 def resample_to_uniform_capacity_axis(df: pd.DataFrame, capacity_points: int = 1000) -> pd.DataFrame:
     """
     Resample voltage data to uniform capacity axis.
@@ -1843,8 +2053,10 @@ def clean_dataframe(df: pd.DataFrame, options: dict, metadata: dict = None) -> p
         - impute_missing: bool (default: True)
         - imputation_method: str ('linear', 'cubic', 'forward_fill', default: 'linear')
         - verify_electrochemical: bool (default: True)
-        - resample_uniform_frequency: bool (default: True) - NEW: Resample to 1 Hz
-        - frequency_hz: float (default: 1.0) - NEW: Target sampling frequency
+        - resample_uniform_frequency: bool (default: False) - ENHANCED v2.0: Preserves original sampling by default
+        - frequency_hz: float (default: None) - Target sampling frequency. None preserves original rate
+        - preserve_original_sampling: bool (default: True) - Keep original data when resampling
+        - detect_time_continuity: bool (default: True) - Detect time gaps and duplicates
         - resample_capacity_axis: bool (default: False)
         - capacity_points: int (default: 1000)
         - resample_voltage_axis: bool (default: False)
@@ -1915,10 +2127,42 @@ def clean_dataframe(df: pd.DataFrame, options: dict, metadata: dict = None) -> p
         apply_to_original = options.get('savgol_apply_to_original', True)
         df_clean = smooth_for_derivatives(df_clean, window_length, polyorder, apply_to_original)
     
-    # Resample to uniform frequency (Issue 3 Fix) - Essential for ICA/dQ/dV
-    if options.get('resample_uniform_frequency', True):  # Default True now
-        frequency_hz = options.get('frequency_hz', 1.0)  # Default 1 Hz
-        df_clean = resample_to_uniform_frequency(df_clean, frequency_hz)
+    # Detect time continuity issues (ENHANCED v2.0: Preserve original sampling)
+    if options.get('detect_time_continuity', True):
+        df_clean = detect_time_continuity_issues(df_clean)
+    
+    # Analyze sampling characteristics (ENHANCED v2.0: Inform user about sampling rate)
+    sampling_info = analyze_sampling_characteristics(df_clean)
+    if metadata is None:
+        metadata = {}
+    metadata['sampling_characteristics'] = sampling_info
+    
+    # Resample to uniform frequency (ENHANCED v2.0: Optional, preserves original by default)
+    # Only resample if explicitly requested or if data is highly irregular
+    should_resample = options.get('resample_uniform_frequency', False)  # Default False now
+    if not should_resample and not sampling_info['is_uniform']:
+        # Auto-resample only if sampling is very irregular (CV > 0.5)
+        cv = sampling_info['std_interval'] / (sampling_info['median_interval'] + 1e-10)
+        should_resample = cv > 0.5
+    
+    if should_resample:
+        frequency_hz = options.get('frequency_hz', None)  # None = preserve original rate
+        preserve_original = options.get('preserve_original_sampling', True)  # Default True
+        
+        if frequency_hz is None:
+            # Use original sampling rate
+            frequency_hz = sampling_info['sampling_rate_hz']
+        
+        df_clean, resample_metadata = intelligent_resample_with_flagging(
+            df_clean, target_frequency_hz=frequency_hz, preserve_original=preserve_original
+        )
+        
+        # Store resampling metadata
+        metadata['resampling'] = resample_metadata
+        if resample_metadata['interpolation_percentage'] > 0:
+            metadata['interpolation_warning'] = (
+                f"{resample_metadata['interpolation_percentage']:.1f}% of data points were interpolated"
+            )
     
     # Apply range filters (replace out-of-range values with 0)
     df_clean = apply_range_filters(df_clean, options)

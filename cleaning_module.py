@@ -10,6 +10,27 @@ from io import BytesIO
 import re
 from datetime import datetime
 from typing import Dict, List, Tuple, Optional, Union
+import os
+import json
+
+# Optional imports for additional file formats
+try:
+    import h5py
+    H5PY_AVAILABLE = True
+except ImportError:
+    H5PY_AVAILABLE = False
+
+try:
+    from sqlalchemy import create_engine, inspect
+    SQLALCHEMY_AVAILABLE = True
+except ImportError:
+    SQLALCHEMY_AVAILABLE = False
+
+try:
+    import sqlite3
+    SQLITE_AVAILABLE = True
+except ImportError:
+    SQLITE_AVAILABLE = False
 
 # Optional imports with fallbacks
 try:
@@ -68,6 +89,252 @@ STANDARD_SCHEMA = {
     'Temperature': 'float',
     'Time': 'float'
 }
+
+# Comprehensive Column Alias Mapping
+# Maps various column name variations to standard names
+COLUMN_ALIAS_MAP = {
+    # Voltage aliases
+    'Voltage': ['voltage', 'v', 'volt', 'volts', 'u', 'u_cell', 'u_cell_v', 'cell_voltage', 
+                'potential', 'potential_v', 'e', 'ewe', 'ewe_v', 'v_cell', 'vcell', 
+                'voltage_v', 'voltage(v)', 'v_measured', 'measured_voltage', 'battery_voltage',
+                'terminal_voltage', 'ocv', 'open_circuit_voltage', 'v_terminal', 'v_battery'],
+    
+    # Current aliases
+    'Current': ['current', 'i', 'i_measured', 'current_a', 'current(a)', 'i_a', 'i_ma', 
+                'current_ma', 'amps', 'ampere', 'amperes', 'i_cell', 'icell', 'i_charge',
+                'i_discharge', 'current_charge', 'current_discharge', 'i_load', 'load_current'],
+    
+    # Capacity aliases
+    'Capacity': ['capacity', 'q', 'q_charge', 'q_discharge', 'capacity_ah', 'capacity(ah)',
+                 'q_ah', 'charge_capacity', 'discharge_capacity', 'capa', 'cap', 'q_cell',
+                 'qcell', 'capacity_charge', 'capacity_discharge', 'q_charge_ah', 'q_discharge_ah',
+                 'cumulative_capacity', 'total_capacity', 'q_total'],
+    
+    # Temperature aliases
+    'Temperature': ['temperature', 'temp', 't', 't_cell', 'tcell', 'temp_c', 'temperature_c',
+                    'temp_celsius', 'temperature_celsius', 't_measured', 'measured_temp',
+                    'cell_temperature', 'battery_temperature', 't_ambient', 'ambient_temp',
+                    't_surface', 'surface_temp', 't_internal', 'internal_temp'],
+    
+    # Time aliases
+    'Time': ['time', 't', 'test_time', 'test_time_s', 'time_s', 'time(s)', 'elapsed_time',
+             'elapsed_time_s', 'step_time', 'step_time_s', 'step_time(s)', 'relative_time',
+             'time_elapsed', 'duration', 't_elapsed', 'time_relative', 't_relative'],
+    
+    # DateTime aliases
+    'DateTime': ['datetime', 'date_time', 'timestamp', 'time_stamp', 'date', 'time_full',
+                 'test_date', 'measurement_time', 'record_time', 'log_time', 'acquisition_time',
+                 'data_time', 'sample_time', 't_datetime', 'dt', 'date_time_full'],
+    
+    # Cycle aliases
+    'Cycle_Index': ['cycle', 'cycle_index', 'cycle_number', 'cycle_num', 'n_cycle', 'ncycle',
+                    'cycle_id', 'cycleid', 'cycle_idx', 'cycleindex', 'cycle_number', 'n',
+                    'cycle_count', 'cycle_count', 'cycle_no', 'cycleno', 'c_cycle'],
+    
+    # Step aliases
+    'Step_Index': ['step', 'step_index', 'step_number', 'step_num', 'n_step', 'nstep',
+                   'step_id', 'stepid', 'step_idx', 'stepindex', 'step_number', 'ns',
+                   'step_count', 'step_no', 'stepno', 's_step', 'test_step', 'step_type_id'],
+}
+
+# Create reverse lookup for quick access
+ALIAS_TO_STANDARD = {}
+for standard_name, aliases in COLUMN_ALIAS_MAP.items():
+    for alias in aliases:
+        ALIAS_TO_STANDARD[alias.lower()] = standard_name
+
+
+def read_file_universal(file_path_or_buffer, file_type: str = None, **kwargs) -> pd.DataFrame:
+    """
+    Universal file reader supporting multiple formats.
+    
+    Supports:
+    - Excel (.xlsx, .xls)
+    - CSV (.csv, .tsv)
+    - JSON (.json)
+    - Text files (.txt, .dat)
+    - HDF5 (.h5, .hdf5)
+    - SQL databases (SQLite, PostgreSQL, MySQL)
+    - MATLAB (.mat)
+    
+    Parameters:
+    -----------
+    file_path_or_buffer : str, path-like, or file-like object
+        Path to file or file buffer
+    file_type : str, optional
+        File type hint ('excel', 'csv', 'json', 'txt', 'hdf5', 'sql', 'mat').
+        If None, auto-detects from extension.
+    **kwargs : dict
+        Additional arguments passed to specific readers
+    
+    Returns:
+    --------
+    pd.DataFrame
+        Loaded dataframe
+    """
+    # Auto-detect file type if not provided
+    if file_type is None:
+        if isinstance(file_path_or_buffer, str):
+            ext = os.path.splitext(file_path_or_buffer)[1].lower()
+        elif hasattr(file_path_or_buffer, 'name'):
+            ext = os.path.splitext(file_path_or_buffer.name)[1].lower()
+        else:
+            raise ValueError("Cannot determine file type. Please specify file_type parameter.")
+        
+        ext_to_type = {
+            '.xlsx': 'excel', '.xls': 'excel',
+            '.csv': 'csv', '.tsv': 'csv',
+            '.json': 'json',
+            '.txt': 'txt', '.dat': 'txt',
+            '.h5': 'hdf5', '.hdf5': 'hdf5',
+            '.db': 'sql', '.sqlite': 'sql', '.sqlite3': 'sql',
+            '.mat': 'mat'
+        }
+        file_type = ext_to_type.get(ext, 'csv')  # Default to CSV
+    
+    file_type = file_type.lower()
+    
+    # Read based on file type
+    if file_type == 'excel':
+        sheet_name = kwargs.get('sheet_name', 0)
+        header = kwargs.get('header', 0)
+        return pd.read_excel(file_path_or_buffer, sheet_name=sheet_name, header=header)
+    
+    elif file_type == 'csv':
+        sep = kwargs.get('sep', ',')
+        header = kwargs.get('header', 0)
+        return pd.read_csv(file_path_or_buffer, sep=sep, header=header)
+    
+    elif file_type == 'json':
+        orient = kwargs.get('orient', 'records')
+        return pd.read_json(file_path_or_buffer, orient=orient)
+    
+    elif file_type == 'txt':
+        # Try to detect delimiter
+        sep = kwargs.get('sep', None)
+        if sep is None:
+            # Read first line to detect delimiter
+            if isinstance(file_path_or_buffer, str):
+                with open(file_path_or_buffer, 'r') as f:
+                    first_line = f.readline()
+            else:
+                pos = file_path_or_buffer.tell()
+                first_line = file_path_or_buffer.readline()
+                file_path_or_buffer.seek(pos)
+            
+            # Common delimiters
+            for delimiter in [',', '\t', ';', '|', ' ']:
+                if delimiter in first_line:
+                    sep = delimiter
+                    break
+            if sep is None:
+                sep = '\s+'  # Whitespace
+        
+        header = kwargs.get('header', 0)
+        return pd.read_csv(file_path_or_buffer, sep=sep, header=header, engine='python')
+    
+    elif file_type == 'hdf5':
+        if not H5PY_AVAILABLE:
+            raise ImportError("h5py is required for HDF5 files. Install with: pip install h5py")
+        
+        key = kwargs.get('key', None)
+        if isinstance(file_path_or_buffer, str):
+            with h5py.File(file_path_or_buffer, 'r') as f:
+                if key is None:
+                    # List available keys
+                    keys = list(f.keys())
+                    if len(keys) == 0:
+                        raise ValueError("No datasets found in HDF5 file")
+                    key = keys[0]  # Use first key
+                
+                data = f[key][:]
+                # Convert to DataFrame
+                if isinstance(data, np.ndarray):
+                    if data.dtype.names:  # Structured array
+                        return pd.DataFrame(data)
+                    else:
+                        # Try to infer column names
+                        return pd.DataFrame(data, columns=[f'col_{i}' for i in range(data.shape[1])])
+                else:
+                    return pd.DataFrame(data)
+        else:
+            raise ValueError("HDF5 files require a file path, not a buffer")
+    
+    elif file_type == 'sql':
+        if not SQLALCHEMY_AVAILABLE and not SQLITE_AVAILABLE:
+            raise ImportError("sqlalchemy or sqlite3 is required for SQL files")
+        
+        table_name = kwargs.get('table_name', None)
+        query = kwargs.get('query', None)
+        
+        if isinstance(file_path_or_buffer, str):
+            # Detect SQLite vs other databases
+            if file_path_or_buffer.endswith(('.db', '.sqlite', '.sqlite3')):
+                if SQLITE_AVAILABLE:
+                    conn = sqlite3.connect(file_path_or_buffer)
+                    if query:
+                        return pd.read_sql_query(query, conn)
+                    elif table_name:
+                        return pd.read_sql_table(table_name, conn)
+                    else:
+                        # List tables and use first one
+                        cursor = conn.cursor()
+                        cursor.execute("SELECT name FROM sqlite_master WHERE type='table';")
+                        tables = cursor.fetchall()
+                        if len(tables) == 0:
+                            raise ValueError("No tables found in SQLite database")
+                        return pd.read_sql_table(tables[0][0], conn)
+                else:
+                    raise ImportError("sqlite3 is required for SQLite files")
+            else:
+                # Other SQL databases (PostgreSQL, MySQL, etc.)
+                if not SQLALCHEMY_AVAILABLE:
+                    raise ImportError("sqlalchemy is required for SQL databases")
+                
+                connection_string = kwargs.get('connection_string', None)
+                if connection_string is None:
+                    raise ValueError("connection_string required for non-SQLite databases")
+                
+                engine = create_engine(connection_string)
+                if query:
+                    return pd.read_sql_query(query, engine)
+                elif table_name:
+                    return pd.read_sql_table(table_name, engine)
+                else:
+                    # List tables and use first one
+                    inspector = inspect(engine)
+                    tables = inspector.get_table_names()
+                    if len(tables) == 0:
+                        raise ValueError("No tables found in database")
+                    return pd.read_sql_table(tables[0], engine)
+        else:
+            raise ValueError("SQL databases require a connection string or file path")
+    
+    elif file_type == 'mat':
+        try:
+            from scipy.io import loadmat
+        except ImportError:
+            raise ImportError("scipy is required for MATLAB files. Install with: pip install scipy")
+        
+        data = loadmat(file_path_or_buffer)
+        # Remove MATLAB metadata keys
+        keys = [k for k in data.keys() if not k.startswith('__')]
+        if len(keys) == 0:
+            raise ValueError("No data found in MATLAB file")
+        
+        # Use first data key
+        mat_data = data[keys[0]]
+        if isinstance(mat_data, np.ndarray):
+            if mat_data.ndim == 2:
+                return pd.DataFrame(mat_data)
+            else:
+                raise ValueError(f"MATLAB data has {mat_data.ndim} dimensions. Expected 2D array.")
+        else:
+            raise ValueError("Unexpected MATLAB data format")
+    
+    else:
+        raise ValueError(f"Unsupported file type: {file_type}")
+
 
 CYCLER_PARSERS = {
     'calce': {
@@ -198,7 +465,9 @@ def detect_cycler_format(df: pd.DataFrame, metadata: dict = None) -> str:
 
 def harmonize_to_standard_schema(df: pd.DataFrame, cycler_format: str = None) -> pd.DataFrame:
     """
-    Map cycler-specific columns to standardized schema.
+    Map cycler-specific columns to standardized schema using comprehensive alias mapping.
+    
+    ENHANCED v2.0: Uses comprehensive COLUMN_ALIAS_MAP for flexible column name recognition
     
     Parameters:
     -----------
@@ -216,74 +485,104 @@ def harmonize_to_standard_schema(df: pd.DataFrame, cycler_format: str = None) ->
         cycler_format = detect_cycler_format(df)
     
     df_clean = df.copy()
-    cols_l = [c.lower() for c in df_clean.columns]
+    cols_l = [str(c).lower() if c is not None else '' for c in df_clean.columns]
     mapping = {}
     
+    # First, try comprehensive alias mapping
+    for col_idx, col_name in enumerate(df_clean.columns):
+        col_lower = str(col_name).lower() if col_name is not None else ''
+        
+        # Check if column name matches any alias
+        if col_lower in ALIAS_TO_STANDARD:
+            standard_name = ALIAS_TO_STANDARD[col_lower]
+            # Only map if not already mapped
+            if standard_name not in mapping.values():
+                mapping[col_name] = standard_name
+                continue
+        
+        # Also check for partial matches (e.g., "Voltage(V)" contains "voltage")
+        for standard_name, aliases in COLUMN_ALIAS_MAP.items():
+            if standard_name not in mapping.values():  # Don't remap
+                for alias in aliases:
+                    if alias.lower() in col_lower or col_lower in alias.lower():
+                        mapping[col_name] = standard_name
+                        break
+                if standard_name in mapping.values():
+                    break
+    
+    # Then, try cycler-specific patterns if format is known
     if cycler_format != 'unknown' and cycler_format in CYCLER_PARSERS:
         patterns = CYCLER_PARSERS[cycler_format]
         
         # Map cycle
-        for pattern in patterns['cycle_cols']:
-            for i, col_l in enumerate(cols_l):
-                if pattern.lower() in col_l:
-                    mapping[df_clean.columns[i]] = 'Cycle_Index'
+        if 'Cycle_Index' not in mapping.values():
+            for pattern in patterns['cycle_cols']:
+                for i, col_l in enumerate(cols_l):
+                    if pattern.lower() in col_l:
+                        mapping[df_clean.columns[i]] = 'Cycle_Index'
+                        break
+                if 'Cycle_Index' in mapping.values():
                     break
-            if 'Cycle_Index' in mapping.values():
-                break
         
         # Map step
-        for pattern in patterns['step_cols']:
-            for i, col_l in enumerate(cols_l):
-                if pattern.lower() in col_l:
-                    mapping[df_clean.columns[i]] = 'Step_Index'
+        if 'Step_Index' not in mapping.values():
+            for pattern in patterns['step_cols']:
+                for i, col_l in enumerate(cols_l):
+                    if pattern.lower() in col_l:
+                        mapping[df_clean.columns[i]] = 'Step_Index'
+                        break
+                if 'Step_Index' in mapping.values():
                     break
-            if 'Step_Index' in mapping.values():
-                break
         
         # Map current
-        for pattern in patterns['current_cols']:
-            for i, col_l in enumerate(cols_l):
-                if pattern.lower() in col_l:
-                    mapping[df_clean.columns[i]] = 'Current'
+        if 'Current' not in mapping.values():
+            for pattern in patterns['current_cols']:
+                for i, col_l in enumerate(cols_l):
+                    if pattern.lower() in col_l:
+                        mapping[df_clean.columns[i]] = 'Current'
+                        break
+                if 'Current' in mapping.values():
                     break
-            if 'Current' in mapping.values():
-                break
         
         # Map voltage
-        for pattern in patterns['voltage_cols']:
-            for i, col_l in enumerate(cols_l):
-                if pattern.lower() in col_l:
-                    mapping[df_clean.columns[i]] = 'Voltage'
+        if 'Voltage' not in mapping.values():
+            for pattern in patterns['voltage_cols']:
+                for i, col_l in enumerate(cols_l):
+                    if pattern.lower() in col_l:
+                        mapping[df_clean.columns[i]] = 'Voltage'
+                        break
+                if 'Voltage' in mapping.values():
                     break
-            if 'Voltage' in mapping.values():
-                break
         
         # Map capacity
-        for pattern in patterns['capacity_cols']:
-            for i, col_l in enumerate(cols_l):
-                if pattern.lower() in col_l or ('capacity' in col_l and 'discharge' not in col_l):
-                    mapping[df_clean.columns[i]] = 'Capacity'
+        if 'Capacity' not in mapping.values():
+            for pattern in patterns['capacity_cols']:
+                for i, col_l in enumerate(cols_l):
+                    if pattern.lower() in col_l or ('capacity' in col_l and 'discharge' not in col_l):
+                        mapping[df_clean.columns[i]] = 'Capacity'
+                        break
+                if 'Capacity' in mapping.values():
                     break
-            if 'Capacity' in mapping.values():
-                break
         
         # Map temperature
-        for pattern in patterns['temp_cols']:
-            for i, col_l in enumerate(cols_l):
-                if pattern.lower() in col_l:
-                    mapping[df_clean.columns[i]] = 'Temperature'
+        if 'Temperature' not in mapping.values():
+            for pattern in patterns['temp_cols']:
+                for i, col_l in enumerate(cols_l):
+                    if pattern.lower() in col_l:
+                        mapping[df_clean.columns[i]] = 'Temperature'
+                        break
+                if 'Temperature' in mapping.values():
                     break
-            if 'Temperature' in mapping.values():
-                break
         
         # Map time
-        for pattern in patterns['time_cols']:
-            for i, col_l in enumerate(cols_l):
-                if pattern.lower() in col_l:
-                    mapping[df_clean.columns[i]] = 'Time'
+        if 'Time' not in mapping.values():
+            for pattern in patterns['time_cols']:
+                for i, col_l in enumerate(cols_l):
+                    if pattern.lower() in col_l:
+                        mapping[df_clean.columns[i]] = 'Time'
+                        break
+                if 'Time' in mapping.values():
                     break
-            if 'Time' in mapping.values():
-                break
     
     # Apply mapping
     df_clean = df_clean.rename(columns=mapping)
@@ -320,6 +619,119 @@ def harmonize_to_standard_schema(df: pd.DataFrame, cycler_format: str = None) ->
         df_clean['DateTime'] = pd.to_datetime(df_clean['Date_Time'], errors='coerce')
     
     return df_clean
+
+
+def export_to_vdf(df: pd.DataFrame, file_path: str, metadata: dict = None) -> None:
+    """
+    Export dataframe to Voltaiq Data Format (VDF) - standardized CSV format.
+    
+    VDF is a standardized CSV schema for battery test data that captures variability
+    across labs and equipment. This function converts cleaned data to VDF format.
+    
+    Parameters:
+    -----------
+    df : pd.DataFrame
+        Cleaned dataframe with standardized schema
+    file_path : str
+        Output file path (.csv)
+    metadata : dict, optional
+        Additional metadata to include in VDF header
+    """
+    # VDF standard columns (Voltaiq Data Format)
+    vdf_columns = {
+        'test_time': 'Time',
+        'date_time': 'DateTime',
+        'cycle_index': 'Cycle_Index',
+        'step_index': 'Step_Index',
+        'current': 'Current',
+        'voltage': 'Voltage',
+        'charge_capacity': 'Capacity',
+        'discharge_capacity': 'Discharge_Capacity',
+        'temperature': 'Temperature',
+        'power': 'Power',
+        'energy': 'Energy'
+    }
+    
+    # Create VDF dataframe
+    vdf_df = pd.DataFrame()
+    
+    # Map standard columns to VDF columns
+    for vdf_col, std_col in vdf_columns.items():
+        if std_col in df.columns:
+            vdf_df[vdf_col] = df[std_col]
+    
+    # Add any additional columns
+    for col in df.columns:
+        if col not in vdf_columns.values():
+            vdf_df[col] = df[col]
+    
+    # Write CSV with metadata header
+    with open(file_path, 'w', encoding='utf-8') as f:
+        # Write VDF header comments
+        f.write("# Voltaiq Data Format (VDF) v1.0\n")
+        f.write("# Standardized battery test data format\n")
+        f.write(f"# Generated: {datetime.now().isoformat()}\n")
+        
+        if metadata:
+            for key, value in metadata.items():
+                f.write(f"# {key}: {value}\n")
+        
+        f.write("#\n")
+        
+        # Write data
+        vdf_df.to_csv(f, index=False, lineterminator='\n')
+
+
+def import_from_vdf(file_path: str) -> Tuple[pd.DataFrame, dict]:
+    """
+    Import dataframe from Voltaiq Data Format (VDF) - standardized CSV format.
+    
+    Parameters:
+    -----------
+    file_path : str
+        Path to VDF file (.csv)
+    
+    Returns:
+    --------
+    Tuple[pd.DataFrame, dict]
+        Dataframe and metadata dictionary
+    """
+    metadata = {}
+    
+    # Read header comments
+    with open(file_path, 'r', encoding='utf-8') as f:
+        lines = []
+        for line in f:
+            if line.startswith('#'):
+                # Parse metadata
+                if ':' in line:
+                    key, value = line[1:].strip().split(':', 1)
+                    metadata[key.strip()] = value.strip()
+                lines.append(line)
+            else:
+                break
+    
+    # Read CSV data
+    df = pd.read_csv(file_path, comment='#')
+    
+    # Map VDF columns back to standard columns
+    vdf_to_standard = {
+        'test_time': 'Time',
+        'date_time': 'DateTime',
+        'cycle_index': 'Cycle_Index',
+        'step_index': 'Step_Index',
+        'current': 'Current',
+        'voltage': 'Voltage',
+        'charge_capacity': 'Capacity',
+        'discharge_capacity': 'Discharge_Capacity',
+        'temperature': 'Temperature',
+        'power': 'Power',
+        'energy': 'Energy'
+    }
+    
+    df_renamed = df.rename(columns=vdf_to_standard)
+    
+    return df_renamed, metadata
 
 
 def normalize_time_to_seconds(df: pd.DataFrame) -> pd.DataFrame:
@@ -479,19 +891,41 @@ def assign_step_types(df: pd.DataFrame) -> pd.DataFrame:
     
     step_types = []
     
-    for idx, row in df_clean.iterrows():
-        current = row.get('Current', 0)
-        voltage = row.get('Voltage', 0)
+    # Extract columns as numpy arrays for safe scalar access
+    current_values = df_clean['Current'].values if 'Current' in df_clean.columns else np.zeros(len(df_clean))
+    voltage_values = df_clean['Voltage'].values if 'Voltage' in df_clean.columns else np.zeros(len(df_clean))
+    
+    for idx in range(len(df_clean)):
+        # Safely extract scalar values
+        current_val = current_values[idx]
+        voltage_val = voltage_values[idx]
         
-        if abs(current) < 0.01:  # Near zero current
+        # Handle array/scalar cases and convert to float
+        if isinstance(current_val, (np.ndarray, list)):
+            current_val = float(current_val[0]) if len(current_val) > 0 else 0.0
+        else:
+            try:
+                current_val = float(current_val) if not pd.isna(current_val) else 0.0
+            except (ValueError, TypeError):
+                current_val = 0.0
+        
+        if isinstance(voltage_val, (np.ndarray, list)):
+            voltage_val = float(voltage_val[0]) if len(voltage_val) > 0 else 0.0
+        else:
+            try:
+                voltage_val = float(voltage_val) if not pd.isna(voltage_val) else 0.0
+            except (ValueError, TypeError):
+                voltage_val = 0.0
+        
+        if abs(current_val) < 0.01:  # Near zero current
             step_type = 'Rest'
-        elif current > 0.01:  # Positive current
-            if voltage > 4.0:  # High voltage
+        elif current_val > 0.01:  # Positive current
+            if voltage_val > 4.0:  # High voltage
                 step_type = 'Constant Voltage Charge'
             else:
                 step_type = 'Constant Current Charge'
-        elif current < -0.01:  # Negative current
-            if voltage < 2.5:  # Low voltage
+        elif current_val < -0.01:  # Negative current
+            if voltage_val < 2.5:  # Low voltage
                 step_type = 'Constant Voltage Discharge'
             else:
                 step_type = 'Constant Current Discharge'
@@ -568,27 +1002,69 @@ def detect_statistical_anomalies(df: pd.DataFrame, window_size: int = 10, method
     available_cols = [c for c in numeric_cols if c in df_clean.columns]
     
     for col in available_cols:
+        # Ensure column is numeric before processing
+        if col not in df_clean.columns:
+            continue
+        
+        # Try to convert to numeric if needed
+        col_data = df_clean[col]
+        if not pd.api.types.is_numeric_dtype(col_data):
+            # Try to convert to numeric
+            col_data_numeric = pd.to_numeric(col_data, errors='coerce')
+            if col_data_numeric.isna().all():
+                # Can't convert to numeric, skip this column
+                continue
+            # Use converted numeric data
+            col_data = col_data_numeric
+        else:
+            # Already numeric, but ensure it's a Series
+            col_data = pd.Series(col_data.values, index=df_clean.index) if not isinstance(col_data, pd.Series) else col_data
+        
         if method == 'zscore' and len(df_clean) > window_size:
             # Z-Score method on moving window
-            rolling_mean = df_clean[col].rolling(window=window_size, center=True).mean()
-            rolling_std = df_clean[col].rolling(window=window_size, center=True).std()
-            z_scores = (df_clean[col] - rolling_mean) / (rolling_std + 1e-10)
-            
-            # Flag outliers (|z| > 3)
-            df_clean.loc[abs(z_scores) > 3, 'Anomaly_Flag'] = True
+            try:
+                rolling_mean = col_data.rolling(window=window_size, center=True).mean()
+                rolling_std = col_data.rolling(window=window_size, center=True).std()
+                z_scores = (col_data - rolling_mean) / (rolling_std + 1e-10)
+                
+                # Flag outliers (|z| > 3) - ensure boolean mask is properly formed
+                anomaly_mask = abs(z_scores) > 3
+                # Convert to numpy boolean array to avoid any pandas indexing issues
+                if isinstance(anomaly_mask, pd.Series):
+                    anomaly_mask_array = anomaly_mask.values
+                else:
+                    anomaly_mask_array = np.asarray(anomaly_mask, dtype=bool)
+                
+                # Flatten if needed
+                if isinstance(anomaly_mask_array, np.ndarray) and anomaly_mask_array.ndim > 1:
+                    anomaly_mask_array = anomaly_mask_array.flatten()
+                
+                # Ensure length matches
+                if len(anomaly_mask_array) == len(df_clean):
+                    df_clean.loc[anomaly_mask_array, 'Anomaly_Flag'] = True
+            except Exception as e:
+                # Skip this column if rolling statistics fail
+                continue
         
         elif method == 'lof' and SKLEARN_AVAILABLE and len(df_clean) > 20:
             # Local Outlier Factor method
             try:
+                # Ensure data is numeric
+                if not pd.api.types.is_numeric_dtype(col_data):
+                    col_data = pd.to_numeric(col_data, errors='coerce')
+                
                 # Use sliding window approach for time series
                 for i in range(window_size, len(df_clean) - window_size):
-                    window_data = df_clean[col].iloc[i-window_size:i+window_size].values.reshape(-1, 1)
-                    if len(window_data) > 5:
-                        lof = LocalOutlierFactor(n_neighbors=min(5, len(window_data)-1))
-                        pred = lof.fit_predict(window_data)
-                        if pred[window_size] == -1:  # Outlier detected
+                    window_data = col_data.iloc[i-window_size:i+window_size].values.reshape(-1, 1)
+                    # Remove NaN values
+                    window_data_clean = window_data[~np.isnan(window_data.flatten())]
+                    if len(window_data_clean) > 5:
+                        window_data_clean = window_data_clean.reshape(-1, 1)
+                        lof = LocalOutlierFactor(n_neighbors=min(5, len(window_data_clean)-1))
+                        pred = lof.fit_predict(window_data_clean)
+                        if len(pred) > window_size and pred[window_size] == -1:  # Outlier detected
                             df_clean.loc[i, 'Anomaly_Flag'] = True
-            except:
+            except Exception:
                 pass
     
     return df_clean

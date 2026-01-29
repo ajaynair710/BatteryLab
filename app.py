@@ -1223,14 +1223,9 @@ def render_copilot(context_key: str, default_context: str = "Design"):
         else:
             from rag_backend import chat_api
             rag_available = True
-    except Exception as e:
-        st.warning("⚠️ RAG Copilot not available.")
-        st.caption(f"Error: {str(e)}")
-        st.info(
-            "📖 **Free (no OpenAI, no S3):** Install Ollama (ollama.com), run `ollama pull llama3.2`, `pip install ollama`. "
-            "Set `RAG_BACKEND = \"ollama\"` in .streamlit/secrets.toml or env, or leave unset with no OPENAI_API_KEY. "
-            "Alternatively: `RAG_BACKEND = \"llamacpp\"` + HF_LLAMA_REPO_ID for local GGUF. See RAG_FREE.md."
-        )
+    except Exception:
+        st.warning("Copilot is not available now.")
+        return
 
     # Display chat history using Streamlit's chat interface
     for msg in st.session_state.chat_history[-12:]:
@@ -3697,8 +3692,6 @@ plt.show()
                             }
                         else:
                             st.info("Click **Visualize recommended plots** to render charts, then see Key Features, interpretations, and download the PDF report.")
-        else:
-            st.info("Upload a CSV with Voltage and Capacity_Ah (or Capacity_mAh). Optional: Cycle column. .mat is supported if SciPy is available.")
 
 # =========================
 # TAB 3: Copilot

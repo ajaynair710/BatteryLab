@@ -18,23 +18,28 @@ warnings.filterwarnings("ignore", category=RuntimeWarning, message=".*divide by 
 warnings.filterwarnings("ignore", category=RuntimeWarning, message=".*invalid value.*")
 warnings.filterwarnings("ignore", category=RuntimeWarning, message=".*All-NaN slice.*")
 
-# PDF export (optional: app runs without it; PDF download disabled if missing)
+# PDF export (required)
 try:
     from reportlab.lib.pagesizes import A4
     from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, Image
     from reportlab.lib.styles import getSampleStyleSheet
     from reportlab.lib import colors
-    REPORTLAB_OK = True
-except Exception:
-    A4 = SimpleDocTemplate = Paragraph = Spacer = Table = TableStyle = Image = None
-    getSampleStyleSheet = lambda: {}
-    colors = None
-    REPORTLAB_OK = False
+except ImportError as e:
+    raise ImportError(
+        "BatteryLab requires 'reportlab' for PDF export. "
+        "Add 'reportlab' to requirements.txt and run 'pip install reportlab', then redeploy."
+    ) from e
 
-# Matplotlib for plots we embed in the PDF
-import matplotlib
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
+# Matplotlib for plots we embed in the PDF (required)
+try:
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+except ImportError as e:
+    raise ImportError(
+        "BatteryLab requires 'matplotlib' for PDF export. "
+        "Add 'matplotlib' to requirements.txt and run 'pip install matplotlib', then redeploy."
+    ) from e
 
 # Optional (MAT/ICA features)
 try:
@@ -3416,21 +3421,18 @@ with tab2:
                             )
                         
                         # PDF Download
-                        if REPORTLAB_OK:
-                            pdf_bytes = generate_pdf_report(
-                                cycle_data=cycle_data_plot,
-                                cycle_features=cycle_features,
-                                degradation_interps=degradation_interps,
-                                time_series=time_series
-                            )
-                            st.download_button(
-                                "Download Full Report (PDF)",
-                                data=pdf_bytes,
-                                file_name="BatteryLab_cycle_analysis_report.pdf",
-                                mime="application/pdf"
-                            )
-                        else:
-                            st.info("PDF export requires **reportlab**. Add `reportlab` to `requirements.txt` and redeploy to enable PDF download.")
+                        pdf_bytes = generate_pdf_report(
+                            cycle_data=cycle_data_plot,
+                            cycle_features=cycle_features,
+                            degradation_interps=degradation_interps,
+                            time_series=time_series
+                        )
+                        st.download_button(
+                            "Download Full Report (PDF)",
+                            data=pdf_bytes,
+                            file_name="BatteryLab_cycle_analysis_report.pdf",
+                            mime="application/pdf"
+                        )
                     else:
                         # Original voltage-capacity processing
                         vcol, qcol, cyc = _standardize_columns(df)
@@ -3684,23 +3686,20 @@ plt.show()
                                 )
 
                             # PDF Download
-                            if REPORTLAB_OK:
-                                pdf_bytes = generate_pdf_report(
-                                    features_by_group=features_by_group,
-                                    richness_notes=richness_notes,
-                                    suggestions=suggestions,
-                                    interps=interps,
-                                    vc_all=vc_all,
-                                    ica_all=ica_all
-                                )
-                                st.download_button(
-                                    "Download Full Report (PDF)",
-                                    data=pdf_bytes,
-                                    file_name="BatteryLab_analytics_report.pdf",
-                                    mime="application/pdf"
-                                )
-                            else:
-                                st.info("PDF export requires **reportlab**. Add `reportlab` to `requirements.txt` and redeploy to enable PDF download.")
+                            pdf_bytes = generate_pdf_report(
+                                features_by_group=features_by_group,
+                                richness_notes=richness_notes,
+                                suggestions=suggestions,
+                                interps=interps,
+                                vc_all=vc_all,
+                                ica_all=ica_all
+                            )
+                            st.download_button(
+                                "Download Full Report (PDF)",
+                                data=pdf_bytes,
+                                file_name="BatteryLab_analytics_report.pdf",
+                                mime="application/pdf"
+                            )
 
                             # Store for Copilot (analytics cache)
                             st.session_state.latest_analytics = {

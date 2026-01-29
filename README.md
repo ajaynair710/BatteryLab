@@ -127,6 +127,16 @@ BatteryLab/
 
 ---
 
+## 📚 Documentation
+
+- **[README_RAG.md](README_RAG.md)** — RAG Copilot setup (OpenAI / local LLM), ingestion, usage  
+- **[RAG_FREE.md](RAG_FREE.md)** — Run RAG **free** (no OpenAI, no S3): Ollama or llama-cpp  
+- **[RAG_PRODUCTION.md](RAG_PRODUCTION.md)** — Run RAG in production (Streamlit Cloud, Docker, VPS)  
+- **[PRODUCTION_USAGE.md](PRODUCTION_USAGE.md)** — **How to use BatteryLab in production** (run, access, configure, Copilot)  
+- **[DEPLOYMENT.md](DEPLOYMENT.md)** — Full deployment guide (Nginx, SSL, secrets, monitoring)
+
+---
+
 ## ⚠️ Disclaimer
 
 > **Note:** This is an illustrative prototype with demonstration models, not lab-calibrated predictions. Results should be validated against experimental data before use in production environments.

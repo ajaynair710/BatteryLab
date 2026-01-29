@@ -19,27 +19,15 @@ warnings.filterwarnings("ignore", category=RuntimeWarning, message=".*invalid va
 warnings.filterwarnings("ignore", category=RuntimeWarning, message=".*All-NaN slice.*")
 
 # PDF export (required)
-try:
-    from reportlab.lib.pagesizes import A4
-    from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, Image
-    from reportlab.lib.styles import getSampleStyleSheet
-    from reportlab.lib import colors
-except ImportError as e:
-    raise ImportError(
-        "BatteryLab requires 'reportlab' for PDF export. "
-        "Add 'reportlab' to requirements.txt and run 'pip install reportlab', then redeploy."
-    ) from e
+from reportlab.lib.pagesizes import A4
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, Image
+from reportlab.lib.styles import getSampleStyleSheet
+from reportlab.lib import colors
 
 # Matplotlib for plots we embed in the PDF (required)
-try:
-    import matplotlib
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
-except ImportError as e:
-    raise ImportError(
-        "BatteryLab requires 'matplotlib' for PDF export. "
-        "Add 'matplotlib' to requirements.txt and run 'pip install matplotlib', then redeploy."
-    ) from e
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 
 # Optional (MAT/ICA features)
 try:

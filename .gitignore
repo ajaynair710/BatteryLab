@@ -207,3 +207,7 @@ marimo/_lsp/
 __marimo__/
 cell11dataset.mat
 cell11dataset_for_python.mat
+
+# RAG System
+rag_data/
+.streamlit/secrets.toml

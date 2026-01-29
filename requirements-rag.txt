@@ -1,0 +1,8 @@
+# RAG / Copilot (optional). Install after requirements.txt: pip install -r requirements-rag.txt
+# Use for local or full Docker deploy. Streamlit Cloud often uses requirements.txt only (slim).
+
+faiss-cpu>=1.7.4
+sentence-transformers>=2.2.2
+tiktoken>=0.5.0
+ollama>=0.1.0
+openai>=1.0.0

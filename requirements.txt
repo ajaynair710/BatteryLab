@@ -13,3 +13,20 @@ python-dateutil>=2.8
 scikit-learn>=1.3
 h5py>=3.10
 sqlalchemy>=2.0
+# RAG Dependencies
+faiss-cpu>=1.7.4
+sentence-transformers>=2.2.2
+PyPDF2>=3.0.1
+pdfplumber>=0.10.0
+tiktoken>=0.5.0
+
+# Ollama Dependencies (free local LLM)
+#   1. Install Ollama service: https://ollama.com/download
+#   2. Run: ollama pull llama3.2
+ollama>=0.1.0
+
+# Hugging Face + llama-cpp-python (local GGUF from HF)
+#   Set RAG_BACKEND=llamacpp or HF_LLAMA_REPO_ID to use. Example:
+#   HF_LLAMA_REPO_ID = "EnlistedGhost/Llama-3.2-11B-Vision-Instruct-OLLAMA"
+#   HF_LLAMA_FILENAME = "Llama-3.2-11B-Vision-Instruct-F16.gguf"
+llama-cpp-python>=0.2.0

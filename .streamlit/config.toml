@@ -4,4 +4,8 @@ gatherUsageStats = false
 [server]
 headless = true
 maxUploadSize = 3000
+port = 8501
+address = "0.0.0.0"
+enableCORS = false
+enableXsrfProtection = true
 

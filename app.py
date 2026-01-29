@@ -44,22 +44,81 @@ from batterylab_recipe_engine import ElectrodeSpec, CellDesignInput, design_pouc
 # Data cleaning module
 from cleaning_module import clean_dataframe, get_dataframe_info, to_csv_download, get_excel_sheets, read_excel_sheets, filter_channel_sheets, validate_analysis_compatibility, to_mat_download, export_to_cell11_mat_format, read_file_universal
 
+# RAG Copilot (integrated into main copilot)
+
+# Paper metadata mapping (filename stem -> title and author)
+PAPER_METADATA = {
+    "Severson_NatureEnergy_2019": {
+        "title": "Data-driven prediction of battery cycle life before capacity degradation",
+        "author": "Severson et al.",
+        "year": "2019",
+        "journal": "Nature Energy"
+    },
+    "Early cycles": {
+        "title": "Early cycles",
+        "author": "Unknown",
+        "year": "Unknown"
+    },
+    "Arrhneius derived emp on Severson": {
+        "title": "Arrhenius-derived empirical model",
+        "author": "Unknown",
+        "year": "Unknown"
+    },
+    "ICA for SOH at Diff Temp": {
+        "title": "ICA for State of Health at Different Temperatures",
+        "author": "Unknown",
+        "year": "Unknown"
+    },
+    "SEI model": {
+        "title": "SEI Model",
+        "author": "Unknown",
+        "year": "Unknown"
+    },
+    "SoH with C rate Emp": {
+        "title": "State of Health with C-rate Empirical Model",
+        "author": "Unknown",
+        "year": "Unknown"
+    },
+    "wang et al": {
+        "title": "Wang et al.",
+        "author": "Wang et al.",
+        "year": "Unknown"
+    }
+}
+
+def _get_paper_citation(paper_name: str) -> str:
+    """Get formatted citation for a paper (author and title only)."""
+    metadata = PAPER_METADATA.get(paper_name, {
+        "title": paper_name,
+        "author": "Unknown",
+        "year": "Unknown"
+    })
+    if metadata.get("journal"):
+        return f"{metadata['author']} ({metadata['year']}), \"{metadata['title']}\", {metadata['journal']}"
+    else:
+        return f"{metadata['author']} ({metadata['year']}), \"{metadata['title']}\""
+
 # ---------------------------
 # Streamlit page config
 # ---------------------------
 st.set_page_config(page_title="BatteryLab Prototype", page_icon=None, layout="wide")
 st.title("BatteryLab — Prototype")
 st.caption(
-    "Recipe -> Performance (with temperature advisories) and Data Analytics: "
-    "Upload -> analysis first (richness and next steps) -> button to visualize -> plots, features, interpretations, PDF export."
+    "Recipe -> Performance (with temperature advisories). "
+    "Data Analytics: Upload (raw or uncleaned) → optional clean → full analysis, plots, PDF export. "
+    "**Copilot** tab: RAG chat over battery research papers."
 )
 
 # ---- Copilot chat memory ----
 if "chat_history" not in st.session_state:
     st.session_state.chat_history = []  # list of {"role": "user"/"assistant", "text": str}
 
-def _copilot_add(role: str, text: str):
-    st.session_state.chat_history.append({"role": role, "text": text})
+def _copilot_add(role: str, text: str, sources: list = None):
+    """Add message to chat history."""
+    msg = {"role": role, "text": text}
+    if sources:
+        msg["sources"] = sources
+    st.session_state.chat_history.append(msg)
 
 # ---- Copilot data caches (latest outputs) ----
 if "latest_design" not in st.session_state:
@@ -1129,63 +1188,124 @@ def _copilot_reply(user_text: str, context: str = "general") -> str:
 # ---------------------------
 # Tabs
 # ---------------------------
-tab1, tab2, tab3 = st.tabs(["Recipe -> Performance", "Data Analytics (CSV/MAT)", "Cleaning Module"])
+tab1, tab2, tab3 = st.tabs(["Recipe -> Performance", "Upload → Clean → Analyze", "Copilot"])
 
 # ==========
-# In-tab Copilot (sticky right column) – shared memory via st.session_state.chat_history
+# In-tab Copilot (RAG-based) – shared memory via st.session_state.chat_history
 # ==========
 def render_copilot(context_key: str, default_context: str = "Design"):
-    radio_key = f"ctx_{context_key}"
     input_key = f"msg_{context_key}"
-    send_key  = f"send_{context_key}"
 
-    st.markdown(
-        """
-        <style>
-          .blab-box { position: sticky; top: 70px; max-height: 78vh; overflow-y: auto; 
-                      background: #f7f7f9; border: 1px solid #ddd; padding: 12px 14px; border-radius: 8px; }
-          .blab-bubble { padding: 8px 10px; border-radius: 10px; margin-bottom: 8px; line-height: 1.45; }
-          .blab-user { background:#DCF8C6; text-align:right; }
-          .blab-bot  { background:#fff; border:1px solid #e6e6e6; }
-        </style>
-        """,
-        unsafe_allow_html=True
-    )
     st.markdown("### BatteryLAB Copilot 💬")
-    st.caption("Always-on chat for this tab. Brainstorm designs, request plots, or ask next steps.")
+    st.caption("Ask questions about battery research based on our knowledge base of 7 research papers.")
 
-    ctx = st.radio(
-        "Context",
-        ["Design", "Analytics"],
-        index=(0 if default_context.lower() == "design" else 1),
-        horizontal=True,
-        key=radio_key
+    # Initialize RAG (free: Ollama or llama-cpp; paid: OpenAI). No API key or S3 required for free path.
+    rag_available = False
+    _backend = (os.getenv("RAG_BACKEND") or "").strip().lower()
+    try:
+        if getattr(st, "secrets", None) and st.secrets.get("RAG_BACKEND"):
+            _backend = str(st.secrets.get("RAG_BACKEND", "")).strip().lower()
+    except Exception:
+        pass
+    _has_openai = bool(os.getenv("OPENAI_API_KEY"))
+    try:
+        if getattr(st, "secrets", None) and st.secrets.get("OPENAI_API_KEY"):
+            _has_openai = True
+    except Exception:
+        pass
+    try:
+        if _backend == "ollama" or (not _backend and not _has_openai):
+            from rag_backend_multi import chat_api
+            rag_available = True
+        elif _backend == "llamacpp" or os.getenv("HF_LLAMA_REPO_ID") or (getattr(st, "secrets", None) and st.secrets.get("HF_LLAMA_REPO_ID")):
+            from rag_backend_llamacpp import chat_api
+            rag_available = True
+        else:
+            from rag_backend import chat_api
+            rag_available = True
+    except Exception as e:
+        st.warning("⚠️ RAG Copilot not available.")
+        st.caption(f"Error: {str(e)}")
+        st.info(
+            "📖 **Free (no OpenAI, no S3):** Install Ollama (ollama.com), run `ollama pull llama3.2`, `pip install ollama`. "
+            "Set `RAG_BACKEND = \"ollama\"` in .streamlit/secrets.toml or env, or leave unset with no OPENAI_API_KEY. "
+            "Alternatively: `RAG_BACKEND = \"llamacpp\"` + HF_LLAMA_REPO_ID for local GGUF. See RAG_FREE.md."
+        )
+
+    # Display chat history using Streamlit's chat interface
+    for msg in st.session_state.chat_history[-12:]:
+        if msg["role"] == "user":
+            with st.chat_message("user"):
+                st.write(msg.get("text", msg.get("content", "")))
+        else:
+            with st.chat_message("assistant"):
+                st.write(msg.get("text", msg.get("content", "")))
+                
+                # Show sources if available
+                if "sources" in msg and msg["sources"]:
+                    with st.expander("📚 Sources", expanded=False):
+                        # Get unique papers (by paper name)
+                        seen_papers = set()
+                        for source in msg["sources"]:
+                            paper_name = source.get('paper', 'Unknown')
+                            if paper_name not in seen_papers:
+                                seen_papers.add(paper_name)
+                                # Format citation
+                                citation = _get_paper_citation(paper_name)
+                                st.write(f"**{citation}**")
+
+    # Chat input
+    user_text = st.chat_input(
+        "Ask a question about battery research…",
+        key=input_key
     )
-
-    with st.container():
-        st.markdown('<div class="blab-box">', unsafe_allow_html=True)
-        for msg in st.session_state.chat_history[-12:]:
-            cls = "blab-user" if msg["role"] == "user" else "blab-bot"
-            who = "You" if msg["role"] == "user" else "Copilot"
-            st.markdown(f'<div class="blab-bubble {cls}"><b>{who}:</b> {msg["text"]}</div>', unsafe_allow_html=True)
-        st.markdown("</div>", unsafe_allow_html=True)
-
-    user_text = st.text_input(
-        "Type a message…",
-        key=input_key,
-        placeholder="e.g. Try Si=0.05 and lower anode porosity by 0.02"
-    )
-    if st.button("Send", key=send_key, use_container_width=True):
-        if user_text.strip():
-            _copilot_add("user", user_text.strip())
-            reply = _copilot_reply(user_text, context=("design" if ctx == "Design" else "analytics"))
-            _copilot_add("assistant", reply)
+    
+    if user_text:
+        _copilot_add("user", user_text.strip())
+        
+        if rag_available:
+            # Use RAG system
+            with st.chat_message("assistant"):
+                with st.spinner("Thinking..."):
+                    try:
+                        response = chat_api(user_text.strip())
+                        answer = response.get('answer', 'No answer generated.')
+                        sources = response.get('sources', [])
+                        
+                        st.write(answer)
+                        
+                        # Display sources
+                        if sources:
+                            with st.expander("📚 Sources", expanded=True):
+                                # Get unique papers (by paper name)
+                                seen_papers = set()
+                                for source in sources:
+                                    paper_name = source.get('paper', 'Unknown')
+                                    if paper_name not in seen_papers:
+                                        seen_papers.add(paper_name)
+                                        # Format citation
+                                        citation = _get_paper_citation(paper_name)
+                                        st.write(f"**{citation}**")
+                        
+                        _copilot_add("assistant", answer, sources=sources)
+                    except Exception as e:
+                        error_msg = f"Error: {str(e)}"
+                        st.error(error_msg)
+                        _copilot_add("assistant", error_msg)
+        else:
+            # Fallback to old system
+            with st.chat_message("assistant"):
+                reply = _copilot_reply(user_text, context="general")
+                st.write(reply)
+                _copilot_add("assistant", reply)
+        
+        st.rerun()
 
 # =========================
-# TAB 1: Recipe -> Performance (temperature-aware) WITH in-tab Copilot
+# TAB 1: Recipe -> Performance (temperature-aware)
 # =========================
 with tab1:
-    col_main, col_chat = st.columns([0.68, 0.32], gap="large")
+    col_main, = st.columns([1])
 
     with col_main:
         PRESETS = {
@@ -1374,27 +1494,27 @@ with tab1:
         else:
             st.info("Pick a preset for a 1-click demo, or set your recipe parameters, then press Compute Performance.")
 
-    with col_chat:
-        render_copilot(context_key="tab1", default_context="Design")
-
 # =========================
-# TAB 2: Data Analytics WITH in-tab Copilot + exports (.mat, .py)
+# TAB 2: Upload → Clean → Analyze (exports .mat, .py, PDF)
 # =========================
 with tab2:
-    col_main, col_chat = st.columns([0.68, 0.32], gap="large")
+    col_main, = st.columns([1])
 
     with col_main:
-        st.subheader("Upload a dataset")
+        st.subheader("Upload a dataset (raw or uncleaned)")
         st.write(
-            "Accepted: .csv (recommended) or .mat (if SciPy is available). "
-            "Two formats supported:\n"
-            "1. **Cycle-level data**: Columns: cycle, discharge_capacity, internal_resistance (optional), temperature (optional). "
+            "Upload **raw or uncleaned** battery data: we optionally **clean** it (harmonize, anomalies, smoothing), then run **full analysis** (plots, features, PDF export). "
+            "Accepted: .csv, .xlsx/.xls, .mat. Two formats supported:\n"
+            "1. **Cycle-level data**: cycle, discharge_capacity, internal_resistance (optional), temperature (optional). "
             "Optional time-series: time_<cycle>, current_<cycle>, voltage_<cycle>.\n"
-            "2. **Voltage-Capacity curves**: Columns: Voltage, Capacity_Ah (or Capacity_mAh). Optional: Cycle (e.g., Fresh/Aged)."
+            "2. **Voltage–Capacity curves**: Voltage, Capacity_Ah (or Capacity_mAh). Optional: Cycle (e.g., Fresh/Aged)."
         )
 
         up = st.file_uploader("Upload CSV, MAT or Excel file", type=["csv", "mat", "xlsx", "xls"])
+        if up is None:
+            st.info("Upload a CSV, Excel, or MAT file above to clean and analyze. You can use raw or uncleaned data.")
         if up is not None:
+            st.session_state.file_metadata = {}
             # Check file size before processing
             file_size_mb = len(up.getvalue()) / (1024 * 1024)
             
@@ -1492,6 +1612,7 @@ with tab2:
                             up.seek(0)
                             metadata = extract_excel_metadata(up)
                             up.seek(0)
+                            st.session_state.file_metadata = metadata
                         except: pass
                         
                         all_sheets = get_excel_sheets(up)
@@ -2696,6 +2817,67 @@ with tab2:
                             st.write(pd.DataFrame(col_types, columns=["column", "dtype"]))
                         except:
                             pass
+                    # ---------- Optional: Clean data before analysis ----------
+                    st.markdown("### Optional: Clean data before analysis")
+                    clean_before_analysis = st.checkbox(
+                        "Clean data before analysis",
+                        value=True,
+                        key="clean_before_analysis",
+                        help="Run harmonization, anomaly detection/correction, and smoothing, then analyze the cleaned data."
+                    )
+                    if clean_before_analysis:
+                        with st.expander("Advanced cleaning options", expanded=False):
+                            adv_segment = st.checkbox("Segment steps and cycles", value=True, key="adv_segment")
+                            adv_anomalies = st.checkbox("Detect and correct anomalies", value=True, key="adv_anomalies")
+                            adv_impute = st.checkbox("Impute missing data", value=True, key="adv_impute")
+                            adv_smooth = st.checkbox("Smooth for derivatives (Savitzky–Golay)", value=True, key="adv_smooth")
+                        _opts = {
+                            "harmonize_schema": True, "detect_cycler": True,
+                            "segment_steps": adv_segment, "assign_step_types": True, "identify_rpt": True,
+                            "detect_anomalies": adv_anomalies, "anomaly_method": "zscore", "anomaly_window_size": 10,
+                            "correct_anomalies": adv_anomalies, "correction_method": "savgol",
+                            "detect_missing_data": True, "max_gap_seconds": 60.0,
+                            "impute_missing": adv_impute, "imputation_method": "linear",
+                            "verify_electrochemical": True,
+                            "resample_uniform_frequency": False, "frequency_hz": 1.0, "preserve_original_sampling": True,
+                            "resample_capacity_axis": False, "capacity_points": 1000,
+                            "resample_voltage_axis": False, "voltage_points": 1000,
+                            "smooth_for_derivatives": adv_smooth, "savgol_window": 51, "savgol_polyorder": 3,
+                            "savgol_apply_to_original": True, "detect_time_continuity": True,
+                            "apply_range_filters": False, "range_filters": {},
+                        }
+                        _meta = st.session_state.get("file_metadata", {}) or {}
+                        try:
+                            with st.spinner("Cleaning data…"):
+                                _df_cleaned = clean_dataframe(df.copy(), _opts, metadata=_meta)
+                            _renames = {}
+                            if "Cycle_Index" in _df_cleaned.columns and "cycle" not in _df_cleaned.columns:
+                                _renames["Cycle_Index"] = "cycle"
+                            if "V" in _df_cleaned.columns and "voltage" not in _df_cleaned.columns:
+                                _renames["V"] = "voltage"
+                            elif "Voltage" in _df_cleaned.columns and "voltage" not in _df_cleaned.columns:
+                                _renames["Voltage"] = "voltage"
+                            if "I" in _df_cleaned.columns and "current" not in _df_cleaned.columns:
+                                _renames["I"] = "current"
+                            elif "Current" in _df_cleaned.columns and "current" not in _df_cleaned.columns:
+                                _renames["Current"] = "current"
+                            if "Capacity" in _df_cleaned.columns and "discharge_capacity" not in _df_cleaned.columns:
+                                _renames["Capacity"] = "discharge_capacity"
+                            if "Temperature" in _df_cleaned.columns and "temperature" not in _df_cleaned.columns:
+                                _renames["Temperature"] = "temperature"
+                            if "Test_Time" in _df_cleaned.columns and "time" not in _df_cleaned.columns:
+                                _renames["Test_Time"] = "time"
+                            if _renames:
+                                _df_cleaned = _df_cleaned.rename(columns=_renames)
+                            df = _df_cleaned
+                            st.session_state.cleaned_df = _df_cleaned
+                            st.session_state.cleaning_applied = True
+                            st.success("Data cleaned. Analysis uses cleaned data.")
+                        except Exception as _e:
+                            st.warning(f"Cleaning failed: {_e}. Proceeding with original data.")
+                            st.session_state.cleaning_applied = False
+                    else:
+                        st.session_state.cleaning_applied = False
                     # Check if this is cycle-level data
                     is_cycle_level = _detect_cycle_level_data(df)
                     
@@ -3518,662 +3700,9 @@ plt.show()
         else:
             st.info("Upload a CSV with Voltage and Capacity_Ah (or Capacity_mAh). Optional: Cycle column. .mat is supported if SciPy is available.")
 
-    with col_chat:
-        render_copilot(context_key="tab2", default_context="Analytics")
-
 # =========================
-# TAB 3: Cleaning Module WITH in-tab Copilot
+# TAB 3: Copilot
 # =========================
 with tab3:
-    col_main, col_chat = st.columns([0.68, 0.32], gap="large")
-    
-    with col_main:
-        st.subheader("Data Cleaning Module")
-        st.write(
-            "Upload a CSV or Excel file to clean and download the cleaned version. "
-            "Configure cleaning options below to customize the cleaning process."
-        )
-        
-        # File uploader
-        uploaded_file = st.file_uploader(
-            "Upload battery data file",
-            type=["csv", "xlsx", "xls", "json", "txt", "dat", "h5", "hdf5", "db", "sqlite", "sqlite3", "mat"],
-            help="Supports: Excel (.xlsx, .xls), CSV (.csv), JSON (.json), Text (.txt, .dat), HDF5 (.h5, .hdf5), SQLite (.db, .sqlite), MATLAB (.mat)"
-        )
-        
-        if uploaded_file is not None:
-            # Read the file
-            try:
-                file_extension = uploaded_file.name.lower().split('.')[-1]
-                is_excel = file_extension in ['xlsx', 'xls']
-                is_multi_sheet = False
-                all_sheets = []
-                channel_sheets = []
-                selected_sheets = []
-                sheets_data = {}
-                
-                # Initialize metadata
-                metadata = {}
-                
-                if file_extension == 'csv':
-                    df_original = read_file_universal(uploaded_file, file_type='csv')
-                    st.session_state.file_type = 'csv'
-                elif file_extension in ['json']:
-                    df_original = read_file_universal(uploaded_file, file_type='json')
-                    st.session_state.file_type = 'json'
-                elif file_extension in ['txt', 'dat']:
-                    df_original = read_file_universal(uploaded_file, file_type='txt')
-                    st.session_state.file_type = 'txt'
-                elif file_extension in ['h5', 'hdf5']:
-                    # HDF5 requires file path, not buffer - save temporarily
-                    import tempfile
-                    with tempfile.NamedTemporaryFile(delete=False, suffix='.h5') as tmp_file:
-                        tmp_file.write(uploaded_file.read())
-                        tmp_path = tmp_file.name
-                    try:
-                        df_original = read_file_universal(tmp_path, file_type='hdf5')
-                        st.session_state.file_type = 'hdf5'
-                    finally:
-                        os.unlink(tmp_path)  # Clean up temp file
-                elif file_extension in ['db', 'sqlite', 'sqlite3']:
-                    # SQLite requires file path, not buffer - save temporarily
-                    import tempfile
-                    with tempfile.NamedTemporaryFile(delete=False, suffix='.db') as tmp_file:
-                        tmp_file.write(uploaded_file.read())
-                        tmp_path = tmp_file.name
-                    try:
-                        df_original = read_file_universal(tmp_path, file_type='sql')
-                        st.session_state.file_type = 'sql'
-                    finally:
-                        os.unlink(tmp_path)  # Clean up temp file
-                elif file_extension == 'mat':
-                    # MATLAB files - save temporarily
-                    import tempfile
-                    with tempfile.NamedTemporaryFile(delete=False, suffix='.mat') as tmp_file:
-                        tmp_file.write(uploaded_file.read())
-                        tmp_path = tmp_file.name
-                    try:
-                        df_original = read_file_universal(tmp_path, file_type='mat')
-                        st.session_state.file_type = 'mat'
-                    finally:
-                        os.unlink(tmp_path)  # Clean up temp file
-                elif is_excel:
-                    try:
-                        # Try importing openpyxl first
-                        import openpyxl
-                        from cleaning_module import extract_excel_metadata
-                        
-                        # Extract metadata from Excel file (Issue 5 Fix)
-                        uploaded_file.seek(0)  # Reset file pointer
-                        metadata = extract_excel_metadata(uploaded_file)
-                        st.session_state.file_metadata = metadata  # Store in session state
-                        uploaded_file.seek(0)  # Reset again for reading
-                        
-                        # Check if Excel file has multiple sheets
-                        all_sheets = get_excel_sheets(uploaded_file)
-                        channel_sheets = filter_channel_sheets(all_sheets)
-                        
-                        if len(all_sheets) > 1:
-                            is_multi_sheet = True
-                            st.session_state.file_type = 'excel_multi'
-                            st.session_state.all_sheets = all_sheets
-                            st.session_state.channel_sheets = channel_sheets
-                            
-                            # Show sheet information
-                            st.info(f"Found {len(all_sheets)} sheet(s): {', '.join(all_sheets)}")
-                            if 'info' in [s.lower() for s in all_sheets]:
-                                st.info("'info' sheet detected and will be excluded from processing.")
-                            
-                            if len(channel_sheets) > 0:
-                                st.success(f"Found {len(channel_sheets)} Channel sheet(s): {', '.join(channel_sheets)}")
-                                
-                                # Sheet selection
-                                st.subheader("Sheet Selection")
-                                selected_sheets = st.multiselect(
-                                    "Select sheets to process",
-                                    options=channel_sheets,
-                                    default=channel_sheets,  # Select all Channel sheets by default
-                                    help="Select which Channel sheets to clean and combine"
-                                )
-                                
-                                if len(selected_sheets) == 0:
-                                    st.warning("Please select at least one sheet to process.")
-                                    st.stop()
-                                
-                                # Read selected sheets
-                                uploaded_file.seek(0)  # Reset file pointer
-                                sheets_data = read_excel_sheets(uploaded_file, selected_sheets)
-                                
-                                # Combine selected sheets
-                                dfs_to_combine = []
-                                for sheet_name in selected_sheets:
-                                    if sheet_name in sheets_data:
-                                        df_sheet = sheets_data[sheet_name].copy()
-                                        # Add a column to identify the source sheet
-                                        df_sheet.insert(0, 'Sheet_Source', sheet_name)
-                                        dfs_to_combine.append(df_sheet)
-                                
-                                if len(dfs_to_combine) > 0:
-                                    df_original = pd.concat(dfs_to_combine, ignore_index=True)
-                                    st.success(f"Combined {len(selected_sheets)} sheet(s): {', '.join(selected_sheets)}")
-                                else:
-                                    st.error("No data found in selected sheets.")
-                                    st.stop()
-                            else:
-                                st.warning("No 'Channel_' sheets found. Processing all sheets except 'info'.")
-                                # Process all sheets except 'info'
-                                sheets_to_process = [s for s in all_sheets if s.lower() != 'info']
-                                if len(sheets_to_process) == 0:
-                                    st.error("No sheets available for processing.")
-                                    st.stop()
-                                
-                                selected_sheets = st.multiselect(
-                                    "Select sheets to process",
-                                    options=sheets_to_process,
-                                    default=sheets_to_process,
-                                    help="Select which sheets to clean and combine"
-                                )
-                                
-                                if len(selected_sheets) == 0:
-                                    st.warning("Please select at least one sheet to process.")
-                                    st.stop()
-                                
-                                uploaded_file.seek(0)
-                                sheets_data = read_excel_sheets(uploaded_file, selected_sheets)
-                                
-                                dfs_to_combine = []
-                                for sheet_name in selected_sheets:
-                                    if sheet_name in sheets_data:
-                                        df_sheet = sheets_data[sheet_name].copy()
-                                        df_sheet.insert(0, 'Sheet_Source', sheet_name)
-                                        dfs_to_combine.append(df_sheet)
-                                
-                                if len(dfs_to_combine) > 0:
-                                    df_original = pd.concat(dfs_to_combine, ignore_index=True)
-                                    st.success(f"Combined {len(selected_sheets)} sheet(s): {', '.join(selected_sheets)}")
-                                else:
-                                    st.error("No data found in selected sheets.")
-                                    st.stop()
-                        else:
-                            # Single sheet Excel file
-                            df_original = pd.read_excel(uploaded_file)
-                            st.session_state.file_type = 'excel_single'
-                    except ImportError as e:
-                        st.error(f"Excel file support requires 'openpyxl' package. Error: {str(e)}")
-                        st.info("**To fix this:**\n1. Make sure you're using the virtual environment Python\n2. Install with: `.venv\\Scripts\\python.exe -m pip install openpyxl`\n3. Or activate venv first: `.venv\\Scripts\\Activate.ps1` then `pip install openpyxl`")
-                        st.stop()
-                    except Exception as e:
-                        pass
+    render_copilot(context_key="tab3", default_context="Analytics")
 
-                        st.error(f"Error reading Excel file: {str(e)}")
-                        st.info("**Troubleshooting:**\n- Make sure the file is a valid Excel file (.xlsx or .xls)\n- Check if the file is corrupted\n- Try opening it in Excel first to verify it's valid")
-                        st.stop()
-                else:
-                    st.error(f"Unsupported file format: {file_extension}. Supported formats: CSV, Excel (.xlsx, .xls), JSON, Text (.txt, .dat), HDF5 (.h5, .hdf5), SQLite (.db, .sqlite), MATLAB (.mat)")
-                    st.stop()
-                
-                st.success(f"File loaded successfully! Shape: {df_original.shape[0]} rows × {df_original.shape[1]} columns")
-                
-                # Store original dataframe and info in session state
-                st.session_state.df_original = df_original
-                info_original = get_dataframe_info(df_original)
-                st.session_state.info_original = info_original
-                
-                # Display original data info
-                with st.expander("Original Data Information", expanded=False):
-                    st.write(f"**Shape:** {info_original['shape'][0]} rows × {info_original['shape'][1]} columns")
-                    st.write(f"**Memory Usage:** {info_original['memory_usage']:.2f} MB")
-                    st.write(f"**Duplicate Rows:** {info_original['duplicate_rows']}")
-                    
-                    if info_original['null_counts']:
-                        st.write("**Missing Values:**")
-                        null_df = pd.DataFrame({
-                            'Column': list(info_original['null_counts'].keys()),
-                            'Null Count': list(info_original['null_counts'].values()),
-                            'Null %': [f"{info_original['null_percentages'][k]:.2f}%" 
-                                       for k in info_original['null_counts'].keys()]
-                        })
-                        st.dataframe(null_df, use_container_width=True)
-                
-                # Preview original data
-                with st.expander("Preview Original Data", expanded=False):
-                    st.dataframe(df_original.head(10), use_container_width=True)
-                
-                # Cleaning options
-                st.subheader("Cleaning Options")
-                
-                # Basic options
-                col1, col2 = st.columns(2)
-                
-                with col1:
-                    remove_duplicates = st.checkbox("Remove duplicate rows", value=True)
-                    remove_empty_rows = st.checkbox("Remove completely empty rows", value=True)
-                    remove_empty_cols = st.checkbox("Remove completely empty columns", value=True)
-                    standardize_names = st.checkbox("Standardize column names (lowercase, underscores)", value=False)
-                    trim_whitespace = st.checkbox("Trim whitespace in text columns", value=True)
-                    convert_numeric = st.checkbox("Convert columns to numeric where possible", value=False)
-                
-                with col2:
-                    fill_na_method = st.selectbox(
-                        "Handle missing values",
-                        options=['drop', 'forward', 'backward', 'interpolate', 'mean', 'median', 'zero', 'custom'],
-                        index=0,
-                        help="Choose how to handle NaN values. 'interpolate' only fills small gaps (<5 samples)."
-                    )
-                    
-                    fill_na_value = None
-                    if fill_na_method == 'custom':
-                        fill_na_value = st.number_input("Custom fill value", value=0.0)
-                    
-                    gap_threshold = st.number_input("Gap threshold (samples)", min_value=1, value=5, 
-                                                    help="Gaps larger than this won't be interpolated")
-                    
-                    remove_outliers = st.checkbox("Remove outliers (statistical)", value=False)
-                    outlier_method = None
-                    if remove_outliers:
-                        outlier_method = st.selectbox(
-                            "Outlier detection method",
-                            options=['iqr', 'zscore'],
-                            index=0,
-                            help="IQR: Interquartile Range method, Z-score: Standard deviation method"
-                        )
-                
-                harmonize_schema = st.checkbox("Harmonize to standard schema", value=True)
-                detect_cycler = st.checkbox("Auto-detect cycler format", value=True)
-                
-                col_phase2_1, col_phase2_2 = st.columns(2)
-                
-                with col_phase2_1:
-                    segment_steps = st.checkbox("Segment steps and cycles", value=True)
-                    assign_step_types = st.checkbox("Assign step types", value=True)
-                    identify_rpt = st.checkbox("Identify RPT cycles", value=True)
-                
-                with col_phase2_2:
-                    detect_anomalies = st.checkbox("Detect statistical anomalies", value=True)
-                    anomaly_method = 'zscore'
-                    anomaly_window_size = 10
-                    if detect_anomalies:
-                        anomaly_method = st.selectbox(
-                            "Anomaly detection method",
-                            options=['zscore', 'lof'],
-                            index=0,
-                            help="Z-Score: Moving window statistical method. LOF: Local Outlier Factor (requires scikit-learn)"
-                        )
-                        anomaly_window_size = st.number_input("Anomaly window size", min_value=5, value=10, step=1)
-                    
-                    correct_anomalies = st.checkbox("Correct detected anomalies", value=True)
-                    correction_method = 'savgol'
-                    if correct_anomalies:
-                        correction_method = st.selectbox(
-                            "Correction method",
-                            options=['savgol', 'interpolate', 'median_filter'],
-                            index=0,
-                            help="Savitzky-Golay: Best for preserving curve shape. Interpolate: Linear interpolation. Median: Simple median filter"
-                        )
-                
-                col_missing_1, col_missing_2 = st.columns(2)
-                with col_missing_1:
-                    detect_missing_data = st.checkbox("Detect missing data gaps", value=True)
-                    max_gap_seconds = 60.0
-                    if detect_missing_data:
-                        max_gap_seconds = st.number_input("Max gap (seconds)", min_value=1.0, value=60.0, step=1.0)
-                
-                with col_missing_2:
-                    impute_missing = st.checkbox("Impute missing data", value=True)
-                    imputation_method = 'linear'
-                    if impute_missing:
-                        imputation_method = st.selectbox(
-                            "Imputation method",
-                            options=['linear', 'cubic', 'forward_fill'],
-                            index=0,
-                            help="Linear: Fast interpolation. Cubic: Smoother curves. Forward fill: Simple fill"
-                        )
-                
-                verify_electrochemical = st.checkbox("Verify electrochemical anomalies (CE, Capacity Drift)", value=True)
-                
-                col_phase3_1, col_phase3_2 = st.columns(2)
-                
-                with col_phase3_1:
-                    resample_capacity_axis = st.checkbox("Resample to uniform capacity axis", value=False)
-                    capacity_points = 1000
-                    if resample_capacity_axis:
-                        capacity_points = st.number_input("Capacity grid points", min_value=100, value=1000, step=100)
-                    
-                    resample_voltage_axis = st.checkbox("Resample to uniform voltage axis", value=False)
-                    voltage_points = 1000
-                    if resample_voltage_axis:
-                        voltage_points = st.number_input("Voltage grid points", min_value=100, value=1000, step=100)
-                
-                with col_phase3_2:
-                    resample_uniform_frequency = st.checkbox("Resample to uniform frequency (1 Hz)", value=False,
-                                                             help="Essential for ICA/dQ/dV analysis. Resamples data to uniform time spacing.")
-                    frequency_hz = 1.0
-                    if resample_uniform_frequency:
-                        frequency_hz = st.number_input("Sampling frequency (Hz)", min_value=0.1, value=1.0, step=0.1,
-                                                       help="Target sampling frequency. Default 1 Hz = 1 sample per second.")
-                    
-                    smooth_for_derivatives = st.checkbox("Smooth for derivative calculation (Savitzky-Golay)", value=True,
-                                                        help="Removes spikes and noise. Enabled by default for better data quality.")
-                    savgol_window = 51
-                    savgol_polyorder = 3
-                    if smooth_for_derivatives:
-                        savgol_window = st.number_input("Savitzky-Golay window", min_value=5, value=51, step=2, 
-                                                       help="Must be odd number. Larger window = more smoothing (default: 51)")
-                        savgol_polyorder = st.number_input("Polynomial order", min_value=1, max_value=5, value=3)
-                
-                # Range filtering options - initialize defaults
-                apply_range_filters = False
-                range_filters = {}
-                
-                with st.expander("Value Range Filtering (Set Out-of-Range Values to 0)", expanded=False):
-                    st.markdown("""
-                    **Battery Data Range Filtering:**
-                    - Select columns and set acceptable value ranges
-                    - Values outside the range will be replaced with 0 (or a custom value)
-                    - Use battery-specific defaults or set custom ranges
-                    """)
-                    
-                    apply_range_filters = st.checkbox("Apply range filters (replace out-of-range with 0)", value=False)
-                    
-                    if apply_range_filters:
-                        # Get numeric columns
-                        numeric_cols = [c for c in df_original.columns 
-                                       if pd.api.types.is_numeric_dtype(df_original[c])]
-                        
-                        if numeric_cols:
-                            # Import battery defaults
-                            from cleaning_module import get_battery_default_ranges
-                            battery_defaults = get_battery_default_ranges()
-                            
-                            # Column selection
-                            selected_filter_cols = st.multiselect(
-                                "Select columns to apply range filters",
-                                options=numeric_cols,
-                                default=[],
-                                help="Choose which columns to filter. Values outside range will be set to 0."
-                            )
-                            
-                            if selected_filter_cols:
-                                st.markdown("---")
-                                st.markdown("**Set Range for Each Column**")
-                                
-                                # Quick apply battery defaults button
-                                if st.button("Apply Battery Default Ranges", help="Apply sensible defaults for common battery parameters"):
-                                    st.info("Battery defaults applied! Adjust ranges below if needed.")
-                                
-                                for col in selected_filter_cols:
-                                    # Try to match column to battery defaults
-                                    col_lower = col.lower()
-                                    default_range = None
-                                    default_unit = ""
-                                    
-                                    for pattern, default in battery_defaults.items():
-                                        if pattern in col_lower:
-                                            default_range = default
-                                            default_unit = default.get('unit', '')
-                                            break
-                                    
-                                    # Get current data range
-                                    col_min_data = float(df_original[col].min()) if len(df_original) > 0 else 0.0
-                                    col_max_data = float(df_original[col].max()) if len(df_original) > 0 else 100.0
-                                    
-                                    # Use battery default if available, otherwise use data range
-                                    if default_range:
-                                        default_min = default_range['min']
-                                        default_max = default_range['max']
-                                        default_replace = default_range.get('replace_with', 0.0)
-                                        st.markdown(f"**{col}** {default_unit} (Battery default range)")
-                                    else:
-                                        default_min = col_min_data
-                                        default_max = col_max_data
-                                        default_replace = 0.0
-                                        st.markdown(f"**{col}**")
-                                    
-                                    # Create columns for inputs
-                                    filter_col1, filter_col2, filter_col3 = st.columns(3)
-                                    
-                                    with filter_col1:
-                                        min_val = st.number_input(
-                                            f"Min value",
-                                            value=default_min,
-                                            key=f"range_min_{col}",
-                                            step=0.01 if abs(default_max - default_min) < 100 else 1.0,
-                                            help=f"Data range: {col_min_data:.4f} to {col_max_data:.4f}"
-                                        )
-                                    
-                                    with filter_col2:
-                                        max_val = st.number_input(
-                                            f"Max value",
-                                            value=default_max,
-                                            key=f"range_max_{col}",
-                                            step=0.01 if abs(default_max - default_min) < 100 else 1.0,
-                                            help=f"Data range: {col_min_data:.4f} to {col_max_data:.4f}"
-                                        )
-                                    
-                                    with filter_col3:
-                                        replace_val = st.number_input(
-                                            f"Replace with",
-                                            value=default_replace,
-                                            key=f"range_replace_{col}",
-                                            step=0.01,
-                                            help="Value to use for out-of-range data (default: 0)"
-                                        )
-                                    
-                                    # Show data statistics
-                                    out_of_range_count = 0
-                                    if len(df_original) > 0:
-                                        out_of_range_mask = (
-                                            (df_original[col] < min_val) | 
-                                            (df_original[col] > max_val)
-                                        )
-                                        out_of_range_count = out_of_range_mask.sum()
-                                        out_of_range_pct = (out_of_range_count / len(df_original)) * 100
-                                        
-                                        if out_of_range_count > 0:
-                                            st.warning(f"{out_of_range_count} values ({out_of_range_pct:.1f}%) will be replaced with {replace_val}")
-                                        else:
-                                            st.success(f"All values are within range")
-                                    
-                                    range_filters[col] = {
-                                        'min': min_val, 
-                                        'max': max_val,
-                                        'replace_with': replace_val
-                                    }
-                                    
-                                    st.markdown("---")
-                        else:
-                            st.info("No numeric columns found for range filtering.")
-                
-                
-                # Clean button
-                if st.button("Clean Data", type="primary", use_container_width=True):
-                    with st.spinner("Cleaning data..."):
-                        # Use stored dataframe if available, otherwise use current
-                        df_to_clean = st.session_state.get('df_original', df_original)
-                        
-                        # Get metadata if available (stored in session state or local variable)
-                        file_metadata = st.session_state.get('file_metadata', {})
-                        if not file_metadata and 'metadata' in locals():
-                            file_metadata = metadata
-                        
-                        cleaning_options = {
-                            # Basic options
-                            'remove_duplicates': remove_duplicates,
-                            'remove_empty_rows': remove_empty_rows,
-                            'remove_empty_cols': remove_empty_cols,
-                            'fill_na_method': fill_na_method,
-                            'fill_na_value': fill_na_value,
-                            'gap_threshold': gap_threshold,
-                            'remove_outliers': remove_outliers,
-                            'outlier_method': outlier_method,
-                            'standardize_names': standardize_names,
-                            'trim_whitespace': trim_whitespace,
-                            'convert_numeric': convert_numeric,
-                            # Phase 1: Data Ingestion and Harmonization
-                            'harmonize_schema': harmonize_schema,
-                            'detect_cycler': detect_cycler,
-                            # Phase 2: Anomaly Detection and Correction
-                            'segment_steps': segment_steps,
-                            'assign_step_types': assign_step_types,
-                            'identify_rpt': identify_rpt,
-                            'detect_anomalies': detect_anomalies,
-                            'anomaly_method': anomaly_method,
-                            'anomaly_window_size': anomaly_window_size,
-                            'correct_anomalies': correct_anomalies,
-                            'correction_method': correction_method,
-                            'detect_missing_data': detect_missing_data,
-                            'max_gap_seconds': max_gap_seconds,
-                            'impute_missing': impute_missing,
-                            'imputation_method': imputation_method,
-                            'verify_electrochemical': verify_electrochemical,
-                            # Phase 3: Preprocessing for Feature Extraction
-                            'resample_uniform_frequency': resample_uniform_frequency,
-                            'frequency_hz': frequency_hz,
-                            'resample_capacity_axis': resample_capacity_axis,
-                            'capacity_points': capacity_points,
-                            'resample_voltage_axis': resample_voltage_axis,
-                            'voltage_points': voltage_points,
-                            'smooth_for_derivatives': smooth_for_derivatives,
-                            'savgol_window': savgol_window,
-                            'savgol_polyorder': savgol_polyorder,
-                            'savgol_apply_to_original': True,  # Apply smoothing to original columns
-                            # Range filtering
-                            'apply_range_filters': apply_range_filters,
-                            'range_filters': range_filters
-                        }
-                        
-                        # Get metadata if available
-                        file_metadata = metadata if 'metadata' in locals() else {}
-                        
-                        df_cleaned = clean_dataframe(df_to_clean, cleaning_options, metadata=file_metadata)
-                        
-                        # Store in session state for download
-                        st.session_state.cleaned_df = df_cleaned
-                        st.session_state.cleaning_applied = True
-                
-                # Display cleaned data if available
-                if st.session_state.get('cleaning_applied', False) and 'cleaned_df' in st.session_state:
-                    df_cleaned = st.session_state.cleaned_df
-                    info_original = st.session_state.get('info_original', {})
-                    
-                    st.subheader("Cleaned Data")
-                    
-                    # Display cleaned data info
-                    with st.expander("Cleaned Data Information", expanded=True):
-                        info_cleaned = get_dataframe_info(df_cleaned)
-                        st.write(f"**Shape:** {info_cleaned['shape'][0]} rows × {info_cleaned['shape'][1]} columns")
-                        st.write(f"**Memory Usage:** {info_cleaned['memory_usage']:.2f} MB")
-                        st.write(f"**Duplicate Rows:** {info_cleaned['duplicate_rows']}")
-                        
-                        # Show changes
-                        if info_original and 'shape' in info_original:
-                            rows_removed = info_original['shape'][0] - info_cleaned['shape'][0]
-                            cols_removed = info_original['shape'][1] - info_cleaned['shape'][1]
-                            if rows_removed > 0 or cols_removed > 0:
-                                st.info(f"Removed {rows_removed} rows and {cols_removed} columns")
-                        
-                        if info_cleaned['null_counts']:
-                            st.write("**Missing Values (after cleaning):**")
-                            null_df = pd.DataFrame({
-                                'Column': list(info_cleaned['null_counts'].keys()),
-                                'Null Count': list(info_cleaned['null_counts'].values()),
-                                'Null %': [f"{info_cleaned['null_percentages'][k]:.2f}%" 
-                                           for k in info_cleaned['null_counts'].keys()]
-                            })
-                            st.dataframe(null_df, use_container_width=True)
-                    
-                    # Preview cleaned data
-                    with st.expander("Preview Cleaned Data", expanded=True):
-                        st.dataframe(df_cleaned.head(10), use_container_width=True)
-                    
-                    # Compatibility validation
-                    compatibility = validate_analysis_compatibility(df_cleaned)
-                    
-                    # Download section
-                    st.subheader("Download Cleaned Data")
-                    
-                    # Show compatibility status
-                    if compatibility['is_compatible']:
-                        st.success(f"Compatible with Analysis Module (Format: {compatibility['format_type'].replace('_', ' ').title()})")
-                    else:
-                        st.warning("Data format may not be recognized by Analysis Module. Ensure you have required columns (cycle/discharge_capacity or Voltage/Capacity).")
-                    
-                    # Show warnings if any
-                    if compatibility['warnings']:
-                        for warning in compatibility['warnings']:
-                            st.info(f"{warning}")
-                    
-                    # Download options
-                    col_dl1, col_dl2 = st.columns(2)
-                    
-                    with col_dl1:
-                        remove_sheet_source = st.checkbox(
-                            "Remove 'Sheet_Source' column for analysis compatibility",
-                            value=('Sheet_Source' in df_cleaned.columns),
-                            help="The Sheet_Source column (added when combining multiple sheets) may interfere with analysis. Remove it for better compatibility."
-                        )
-                    
-                    with col_dl2:
-                        download_format = st.radio(
-                            "Download format",
-                            options=["CSV", "Excel"],
-                            index=0,
-                            horizontal=True
-                        )
-                    
-                    # Generate download data
-                    if download_format == "CSV":
-                        csv_data = to_csv_download(df_cleaned, "cleaned_data.csv", remove_sheet_source=remove_sheet_source)
-                        st.download_button(
-                            label="Download Cleaned CSV",
-                            data=csv_data,
-                            file_name="cleaned_data.csv",
-                            mime="text/csv",
-                            type="primary",
-                            use_container_width=True
-                        )
-                    elif download_format == "Excel":
-                        # Create Excel file in memory
-                        excel_buffer = BytesIO()
-                        df_export = df_cleaned.copy()
-                        if remove_sheet_source and 'Sheet_Source' in df_export.columns:
-                            df_export = df_export.drop(columns=['Sheet_Source'])
-                        
-                        with pd.ExcelWriter(excel_buffer, engine='openpyxl') as writer:
-                            df_export.to_excel(writer, index=False, sheet_name='Cleaned_Data')
-                        excel_buffer.seek(0)
-                        
-                        st.download_button(
-                            label="Download Cleaned Excel",
-                            data=excel_buffer.getvalue(),
-                            file_name="cleaned_data.xlsx",
-                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                            type="primary",
-                            use_container_width=True
-                        )
-                    else:  # MAT format (cell11dataset_for_python.mat)
-                        try:
-                            mat_filename = f"{cell_id}dataset_for_python.mat"
-                            mat_data = to_mat_download(df_cleaned, mat_filename, cell_id=cell_id)
-                            st.download_button(
-                                label=f"Download {mat_filename}",
-                                data=mat_data,
-                                file_name=mat_filename,
-                                mime="application/octet-stream",
-                                type="primary",
-                                use_container_width=True
-                            )
-                            st.info(f"Data will be saved in cell11dataset_for_python.mat format with cell ID: {cell_id}")
-                        except ImportError:
-                            st.error("SciPy is required for .mat export. Install with: pip install scipy")
-                        except Exception as e:
-                            st.error(f"Error creating .mat file: {str(e)}")
-                    
-            except Exception as e:
-                st.error(f"Error processing file: {str(e)}")
-                st.exception(e)
-        else:
-            st.info(" Please upload a CSV or Excel file to get started with data cleaning.")
-    
-    with col_chat:
-        render_copilot(context_key="tab3", default_context="Analytics")
